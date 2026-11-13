@@ -81593,6 +81593,17 @@ static inline void touchScreenBacklight(bool on) {
 // stops listening to the mesh — we just stop burning 240 MHz to render nothing.
 // Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
 // switches when the target changes (the call is a hard DFS switch).
+#if defined(HAS_WIO_TRACKER_L2) && !defined(WADA_WEB)
+// True when no companion app is connected RIGHT NOW. getProtoNumClients() is a
+// since-boot registry of client identities (only ever incremented, reset in the
+// MyMesh constructor), so once any app has connected it stays >0 until reboot
+// and cannot gate an idle policy. The transport's isConnected() checks the live
+// USB/BLE/TCP/WS links instead (USB counts only once a client actually speaks).
+static bool noLiveCompanionClient() {
+  BaseSerialInterface* si = g_lv.task ? g_lv.task->serialInterface() : nullptr;
+  return !(si && si->isConnected());
+}
+#endif
 #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
 // A joined Wi-Fi is the largest draw after the backlight: with the screen
 // dark and no app connected, let the modem sleep through more beacons (maximum
@@ -81617,7 +81628,7 @@ static void pagerWifiPsUpdate(int screen_on) {
   // Opt-in like the GNSS rail cut and the panel sleep: the Battery saver toggle
   // is the master switch for the whole regime. Saver off = the plain DTIM
   // modem sleep (MIN_MODEM) main.cpp set at association, exactly as before.
-  const bool park = touchSleep::enabled() && !s_screen_on && the_mesh.getProtoNumClients() == 0;
+  const bool park = touchSleep::enabled() && !s_screen_on && noLiveCompanionClient();
 #else
   const bool park = !s_screen_on && the_mesh.getProtoNumClients() == 0;
 #endif
@@ -86274,7 +86285,7 @@ void UITask::loop() {
       s_idle_ps_ms = now;
       pagerWifiPsUpdate(-1);
       const bool idle = touchSleep::enabled() && tsScreenOff() &&
-                        the_mesh.getProtoNumClients() == 0 && tsOnBattery();
+                        noLiveCompanionClient() && tsOnBattery();
       if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
         mt->setBleIdleAdvertising(idle);
     }
