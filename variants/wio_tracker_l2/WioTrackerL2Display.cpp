@@ -103,6 +103,7 @@ bool WioTrackerL2Display::begin() {
   Wire.begin(47, 48, 100000);
   _lcd.setSwapBytes(true);
   _lcd.setRotation(0);
+  _panelAsleep = false;   // the init sequence ends in SLPOUT: the panel is awake
   _lcd.setBrightness(160);
   _lcd.fillScreen(0);
   setLogicalSize(_lcd.width(), _lcd.height());
@@ -111,8 +112,8 @@ bool WioTrackerL2Display::begin() {
   return true;
 }
 
-void WioTrackerL2Display::turnOn() { if (!_isOn) { _lcd.setBrightness(160); _isOn = true; } }
-void WioTrackerL2Display::turnOff() { if (_isOn) { _lcd.setBrightness(0); _isOn = false; } }
+void WioTrackerL2Display::turnOn() { if (!_isOn) { setBrightness(160); _isOn = true; } }
+void WioTrackerL2Display::turnOff() { if (_isOn) { setBrightness(0); _isOn = false; } }
 void WioTrackerL2Display::clear() { _lcd.fillScreen(0); }
 void WioTrackerL2Display::startFrame(ColorVal bkg) { _lcd.fillScreen(bkg); }
 void WioTrackerL2Display::setTextSize(int sz) { _lcd.setTextSize(sz); }
@@ -127,6 +128,11 @@ void WioTrackerL2Display::endFrame() {}
 
 void WioTrackerL2Display::writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels) {
   if (!_isOn || !pixels || w <= 0 || h <= 0) return;
+  // A deliberate paint while the panel sleeps must land in GRAM: the message
+  // glance paints BEFORE the backlight comes on (no stale-frame flash), and
+  // screenshots force lv_refr_now. Wake first. Idle-dark rendering never gets
+  // here -- the UI pauses LVGL's refresh timer while the screen is off.
+  panelWake();
   _lcd.startWrite();
   _lcd.setAddrWindow(x, y, w, h);
   _lcd.writePixels(const_cast<uint16_t*>(pixels), (uint32_t)w * h);
@@ -143,8 +149,41 @@ void WioTrackerL2Display::setDisplayRotation(uint8_t rotation) {
   setLogicalSize(_lcd.width(), _lcd.height());
 }
 
+// Screen off on this board is brightness 0 (touchScreenBacklight -> here);
+// every wake goes through applyBrightness -> here with a non-zero value.
+// Backlight off alone leaves the NV3031B refreshing the same static image
+// behind the dark glass: panel drive current for nothing, and the same
+// crystal-bias burn-in risk the ST7789/ST7796 boards fixed with SLPIN.
+// Sleep the panel too, and wake it BEFORE lighting it so no stale frame
+// flashes while the booster settles.
 void WioTrackerL2Display::setBrightness(uint8_t brightness) {
-  _lcd.setBrightness(brightness);
+  if (brightness == 0) {
+    _lcd.setBrightness(0);
+    if (!_panelAsleep) {
+      _panel.setSleep(true);          // SLPIN: stop oscillator/booster/LC drive
+      _panelAsleep = true;
+      _sleepInMs = millis();
+    }
+  } else {
+    panelWake();
+    _lcd.setBrightness(brightness);
+  }
+}
+
+// NV3031B needs >=120 ms after SLPIN before the next command and >=120 ms
+// after SLPOUT before the panel is ready (LovyanGFX's CMD_SLPIN_DELAY /
+// CMD_SLPOUT_DELAY for this panel). The sleep-in window is enforced here,
+// not at sleep time, so going dark never blocks; a wake right after sleep
+// pays the remainder. The sleep-out wait runs with the backlight still off.
+// GRAM may not survive sleep intact (the ST7796 Pager saw corrupted bands),
+// so the UI repaints the whole screen on every off->on transition.
+void WioTrackerL2Display::panelWake() {
+  if (!_panelAsleep) return;
+  const uint32_t since = millis() - _sleepInMs;
+  if (since < 120) delay(120 - since);
+  _panel.setSleep(false);             // SLPOUT
+  delay(120);
+  _panelAsleep = false;
 }
 
 bool WioTrackerL2Display::getTouchPoint(uint16_t& x, uint16_t& y) {
