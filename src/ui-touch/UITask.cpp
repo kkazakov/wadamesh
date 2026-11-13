@@ -81629,7 +81629,13 @@ static void pagerWifiPsUpdate(int screen_on) {
   // modem sleep (MIN_MODEM) main.cpp set at association, exactly as before.
   const bool park = touchSleep::enabled() && !s_screen_on && noLiveCompanionClient();
 #else
-  const bool park = !s_screen_on && the_mesh.getProtoNumClients() == 0;
+  // Live connections, not the since-boot client registry: getProtoNumClients()
+  // counts identities registered since boot and only ever increments (reset in
+  // the MyMesh constructor), so once an app had connected it never returned to 0
+  // and the node could not park again until reboot -- the same bug the Wio L2
+  // branch above was fixed for. USB only counts as connected once a client
+  // actually speaks, so a passive debug console does not hold the modem awake.
+  const bool park = !s_screen_on && noLiveCompanionClient();
 #endif
   const int8_t deep = park ? 1 : 0;
   if (deep == s_applied) return;
@@ -85812,7 +85818,19 @@ void UITask::loop() {
 #if !defined(WADA_WEB)
   {
     static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) { s_wifi_ps_ms = now; pagerWifiPsUpdate(-1); }
+    if (now - s_wifi_ps_ms >= 1000) {
+      s_wifi_ps_ms = now;
+      pagerWifiPsUpdate(-1);
+      // Parked: stretch the phone-link advertising interval to 1-2 s so the BT
+      // controller wakes far less often while nobody is looking. The interval
+      // lives in the persistent NimBLEAdvertising object, so the core's
+      // disconnect-restart picks it up unchanged. Not saver-gated here: this
+      // board's Wi-Fi park above is not either, so both halves of the idle
+      // policy follow the same rule. tsScreenOff() excludes the lit screensaver.
+      const bool idle = tsScreenOff() && noLiveCompanionClient() && tsOnBattery();
+      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
+        mt->setBleIdleAdvertising(idle);
+    }
   }
 #endif
   {
@@ -85884,7 +85902,18 @@ void UITask::loop() {
 #if defined(ESP32) && defined(HAS_THINKNODE_M9) && !defined(WADA_WEB)
   {
     static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) { s_wifi_ps_ms = now; pagerWifiPsUpdate(-1); }
+    if (now - s_wifi_ps_ms >= 1000) {
+      s_wifi_ps_ms = now;
+      pagerWifiPsUpdate(-1);
+      // Same idle BLE policy as the Pager and the Wio L2: parked (screen dark,
+      // no live app, on battery) the phone link only needs to stay discoverable,
+      // so advertise at 1-2 s instead of the host default. Not saver-gated, to
+      // match this board's Wi-Fi park above. Keyboard mode (phone link paused)
+      // is left alone inside setBleIdleAdvertising().
+      const bool idle = tsScreenOff() && noLiveCompanionClient() && tsOnBattery();
+      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
+        mt->setBleIdleAdvertising(idle);
+    }
   }
 #endif
   uiCp("ui:keys");
