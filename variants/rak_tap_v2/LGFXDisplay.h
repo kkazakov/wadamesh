@@ -54,4 +54,9 @@ public:
 
   // ---- Hardware panel rotation ----
   void setDisplayRotation(uint8_t r);
+
+  // ---- Anti-burn-in panel sleep (SLPIN/SLPOUT) ----
+  // Screen off on this board is LEDC duty 0 (HAS_BACKLIGHT_PWM), which leaves the
+  // ST7789 refreshing a static image behind dark glass. Sleep the panel too.
+  void panelSleep(bool sleep);
 };

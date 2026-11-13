@@ -123,4 +123,20 @@ void LGFXDisplay::setDisplayRotation(uint8_t) {
   setLogicalSize(_lcd.width(), _lcd.height());
 }
 
+// Anti-burn-in panel sleep over LGFX's own SPI2 bus. SLPIN stops the oscillator,
+// booster and LC drive; the ST7789 retains its RAM, so wake = SLPOUT and the old
+// frame is back with no redraw -- the same contract the T-Deck, Heltec and M9
+// shims rely on. Using LGFX's bus rather than a second SPIClass on these pins is
+// what keeps the shared FSPI bus intact: bus_shared=true with the LoRa radio, and
+// the R8's frozen-display failure came from re-routing SCLK/MOSI to another port.
+// writePixelsRGB565() here is synchronous (startWrite..endWrite in one call), so
+// unlike the Heltec driver there is no open frame to finish before the command.
+// LovyanGFX writes the bare command with no delay: t_SLPIN wants 5 ms of bus
+// quiet after SLPIN, and >=5 ms after SLPOUT before the next command -- the wake
+// path lights the backlight and flushes LVGL immediately afterwards.
+void LGFXDisplay::panelSleep(bool sleep) {
+  if (sleep) { _lcd.sleep();  delay(5); }   // SLPIN
+  else       { _lcd.wakeup(); delay(6); }   // SLPOUT
+}
+
 #endif
