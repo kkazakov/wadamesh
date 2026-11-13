@@ -81454,6 +81454,22 @@ static void touchPanelSleep(bool slp) {
   s_asleep = slp;
   display.panelSleep(slp);
 }
+#elif defined(HAS_RAK_TAP_V2)
+// ---- RAK Tap V2 ST7789 panel sleep (power, anti burn-in) --------------------
+// The same gap the Pager had. This board defines PIN_TFT_LEDA_CTL, so it takes
+// the HAS_BACKLIGHT_PWM path and screen-off is LEDC duty 0 -- which left the
+// ST7789 refreshing the same static image behind dark glass: panel drive current
+// for nothing, plus the crystal-bias burn-in the other ST7789 boards fixed with
+// SLPIN. display.turnOff() is deliberately NOT used here: it also releases the
+// GPIO14 peripheral rail that the touch controller and the I2C sensors share, so
+// sleeping the panel has to be its own call. The driver routes SLPIN/SLPOUT
+// through LGFX's own SPI2 bus, which is shared with the LoRa radio (bus_shared).
+static void touchPanelSleep(bool slp) {
+  static bool s_asleep = false;
+  if (slp == s_asleep) return;
+  s_asleep = slp;
+  display.panelSleep(slp);
+}
 #else
 static inline void touchPanelSleep(bool) {}
 #endif
