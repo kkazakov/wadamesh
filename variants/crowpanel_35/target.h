@@ -9,7 +9,7 @@
 #include <helpers/SensorManager.h>
 #include "../../src/helpers/ClockFloorRTC.h"
 #include "helpers/sensors/EnvironmentSensorManager.h"
-#include "helpers/sensors/MicroNMEALocationProvider.h"
+#include "../../src/helpers/WadaNmeaLocationProvider.h"   // the core provider plus UBX stop/start
 #include "CrowPanel35Board.h"
 #include "CrowPanel35Display.h"
 
