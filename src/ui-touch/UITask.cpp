@@ -215,7 +215,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #if defined(HAS_PAGER_KEYBOARD)
     #include "../helpers/input/PagerKeyboard.h"
   #endif
-  #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
+  #if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
     #include <esp_wifi.h>              // esp_wifi_set_ps: deeper modem sleep while the screen is off
   #endif
   #if defined(TLORA_PAGER)
@@ -81605,7 +81605,19 @@ static inline void touchScreenBacklight(bool on) {
 // stops listening to the mesh — we just stop burning 240 MHz to render nothing.
 // Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
 // switches when the target changes (the call is a hard DFS switch).
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
+#if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
+// The idle regime's master switch. The Pager and the M9 have parked unconditionally
+// since before the Battery saver existed, and gating them now would take away
+// saving their users already rely on. Every other board is opt-in through the
+// saver, like the GNSS rail cut, the panel sleep and the render pause.
+static inline bool idlePowerOptIn() {
+#if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+  return true;
+#else
+  return touchSleep::enabled();
+#endif
+}
+
 // A joined Wi-Fi is the largest draw after the backlight: with the screen
 // dark and no app connected, let the modem sleep through more beacons (maximum
 // modem sleep: it wakes every listen interval instead of every DTIM). Still
@@ -81619,26 +81631,21 @@ static void pagerWifiPsUpdate(int screen_on) {
   static int8_t s_applied = -1;          // 1 = MAX_MODEM, 0 = MIN_MODEM, -1 = not set
   if (screen_on >= 0) s_screen_on = screen_on != 0;
   if (WiFi.getMode() == WIFI_OFF) { s_applied = -1; return; }
-#if defined(HAS_WIO_TRACKER_L2)
   // Only touch PS while associated: modem sleep on an unassociated STA naps
-  // through the setup wizard's scan dwell ("no networks found" -- the reason
-  // main.cpp defers WiFi.setSleep until after association), and MAX_MODEM only
-  // buys anything on a joined link. main.cpp owns the one-shot DTIM enable at
+  // through the setup wizard's scan dwell ("no networks found") -- the reason
+  // main.cpp defers WiFi.setSleep until after association on EVERY board, not
+  // just the Wio L2 this guard was first written for. MAX_MODEM only buys
+  // anything on a joined link. main.cpp owns the one-shot DTIM enable at
   // association; after a link loss the next poll re-applies from scratch.
   if (WiFi.status() != WL_CONNECTED) { s_applied = -1; return; }
-  // Opt-in like the GNSS rail cut and the panel sleep: the Battery saver toggle
-  // is the master switch for the whole regime. Saver off = the plain DTIM
-  // modem sleep (MIN_MODEM) main.cpp set at association, exactly as before.
-  const bool park = touchSleep::enabled() && !s_screen_on && noLiveCompanionClient();
-#else
   // Live connections, not the since-boot client registry: getProtoNumClients()
   // counts identities registered since boot and only ever increments (reset in
   // the MyMesh constructor), so once an app had connected it never returned to 0
-  // and the node could not park again until reboot -- the same bug the Wio L2
-  // branch above was fixed for. USB only counts as connected once a client
-  // actually speaks, so a passive debug console does not hold the modem awake.
-  const bool park = !s_screen_on && noLiveCompanionClient();
-#endif
+  // and the node could not park again until reboot. USB only counts as connected
+  // once a client actually speaks, so a passive debug console does not hold the
+  // modem awake. On the opt-in boards, saver off = the plain DTIM modem sleep
+  // (MIN_MODEM) main.cpp set at association, exactly as before.
+  const bool park = idlePowerOptIn() && !s_screen_on && noLiveCompanionClient();
   const int8_t deep = park ? 1 : 0;
   if (deep == s_applied) return;
   if (esp_wifi_set_ps(deep ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM) == ESP_OK) {
@@ -81662,7 +81669,7 @@ static void setCpuForScreen(bool screen_on) {
   setCpuFrequencyMhz(want);
   s_cur_mhz = want;
 #endif
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
+#if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
   pagerWifiPsUpdate(screen_on);
 #endif
 }
@@ -85817,24 +85824,8 @@ void UITask::loop() {
 #if defined(TLORA_PAGER)
   pagerHapticsIdleTick();   // vibration motor back to standby once its pattern has run out
   pagerImuIdleTick();       // and the accelerometer off once no app is reading it
-#if !defined(WADA_WEB)
-  {
-    static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) {
-      s_wifi_ps_ms = now;
-      pagerWifiPsUpdate(-1);
-      // Parked: stretch the phone-link advertising interval to 1-2 s so the BT
-      // controller wakes far less often while nobody is looking. The interval
-      // lives in the persistent NimBLEAdvertising object, so the core's
-      // disconnect-restart picks it up unchanged. Not saver-gated here: this
-      // board's Wi-Fi park above is not either, so both halves of the idle
-      // policy follow the same rule. tsScreenOff() excludes the lit screensaver.
-      const bool idle = tsScreenOff() && noLiveCompanionClient() && tsOnBattery();
-      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
-        mt->setBleIdleAdvertising(idle);
-    }
-  }
-#endif
+  // The idle Wi-Fi/BLE poll used to live here; it is on the common loop path now,
+  // shared with every other multi-transport board (search s_idle_ps_ms).
   {
     // The stored charging limits (Settings > Battery > Charging), once, as soon as
     // the loop runs: TLoraPagerBoard::begin() starts at the safe defaults.
@@ -85900,23 +85891,6 @@ void UITask::loop() {
 #endif
 #if defined(HAS_THINKNODE_M9)
   pagerLowBatteryTick(now);
-#endif
-#if defined(ESP32) && defined(HAS_THINKNODE_M9) && !defined(WADA_WEB)
-  {
-    static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) {
-      s_wifi_ps_ms = now;
-      pagerWifiPsUpdate(-1);
-      // Same idle BLE policy as the Pager and the Wio L2: parked (screen dark,
-      // no live app, on battery) the phone link only needs to stay discoverable,
-      // so advertise at 1-2 s instead of the host default. Not saver-gated, to
-      // match this board's Wi-Fi park above. Keyboard mode (phone link paused)
-      // is left alone inside setBleIdleAdvertising().
-      const bool idle = tsScreenOff() && noLiveCompanionClient() && tsOnBattery();
-      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
-        mt->setBleIdleAdvertising(idle);
-    }
-  }
 #endif
   uiCp("ui:keys");
   for (int kbi = 0; kbi < 12; ++kbi) {
@@ -86300,21 +86274,27 @@ void UITask::loop() {
   if (g_web_mirror.active() && g_web_mirror.takeFullRepaint())
     lv_obj_invalidate(lv_scr_act());
 #endif
-#if defined(HAS_WIO_TRACKER_L2) && !defined(WADA_WEB)
-  // Idle Wi-Fi/BLE power policy (battery plan option 3). The Pager/M9 poll this
-  // from their keyboard-drain branches; this touch-only board has no such
-  // branch, so poll here on the common path. Once a second, catch clients
-  // coming/going and saver toggles between screen transitions: parked (screen
-  // dark, no app, on battery, Battery saver on) -> Wi-Fi MAX_MODEM + stretched
-  // BLE advertising; any activity reverses both within the same second.
-  // tsScreenOff() excludes the lit screensaver -- it animates, so the device
-  // is not parked while it is up.
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
+  // Idle Wi-Fi/BLE power policy: one poll for every multi-transport board. The
+  // Pager and the M9 used to run their own copy from their keyboard-drain
+  // branches; consolidating here leaves one place to reason about and no board
+  // polling twice. Once a second, catch clients coming/going and saver toggles
+  // between screen transitions: parked (screen dark, no live app, on battery)
+  // -> Wi-Fi MAX_MODEM + stretched BLE advertising; any activity reverses both
+  // within the same second. tsScreenOff() excludes the lit screensaver -- it
+  // animates, so the device is not parked while it is up.
+  // idlePowerOptIn() is the Battery saver gate everywhere except the Pager/M9,
+  // whose unconditional park predates the saver (see pagerWifiPsUpdate).
+  // Boards with no battery sensing (CAP_BATTERY 0: CrowPanel 3.5/5.0, SenseCAP,
+  // CrowPanel P4) read tsOnBattery() as always true, so they park whenever dark
+  // with no client. Intended: there is no cell to protect, and a parked modem
+  // still saves power on USB.
   {
     static uint32_t s_idle_ps_ms = 0;
     if (now - s_idle_ps_ms >= 1000) {
       s_idle_ps_ms = now;
       pagerWifiPsUpdate(-1);
-      const bool idle = touchSleep::enabled() && tsScreenOff() &&
+      const bool idle = idlePowerOptIn() && tsScreenOff() &&
                         noLiveCompanionClient() && tsOnBattery();
       if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
         mt->setBleIdleAdvertising(idle);
