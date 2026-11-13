@@ -59,6 +59,13 @@ class WadaNmeaLocationProvider : public LocationProvider {
   // speed it finds becomes the setting (CAP_GPS_BAUD_AUTO boards).
   bool _keep_choice = false;
   bool _ubx_standby = false;      // rest in software standby (setUbxStandby)
+  // Cold-start aiding (setAidSource). A board that cuts the GNSS rail loses the
+  // ephemeris, so every saver wake searches the whole sky; telling the receiver
+  // the time and the node's last position narrows that search. Inert unless a
+  // board opts in. The Pager aids itself in PagerGps and does not use this.
+  bool   (*_aid_pos)(double* lat, double* lon) = nullptr;
+  bool   (*_aid_time_ok)() = nullptr;
+  uint32_t _aid_at = 0;           // millis() to send the aiding, 0 = nothing pending
   uint8_t _wake_tries = 0;
   uint32_t _wake_check_ms = 0;    // when begin() looks for the stream again (0: not waiting)
   uint32_t _valid_sentences = 0;  // checksummed sentences since boot (the GPS page shows them)
@@ -129,6 +136,62 @@ class WadaNmeaLocationProvider : public LocationProvider {
     _gps_serial->flush();
   }
 
+  // ---- cold-start aiding (UBX-MGA-INI), opt-in via setAidSource ----
+  // Same messages and reasoning as the Pager's PagerGps::sendAiding(), which was
+  // verified on its MIA-M10Q; kept separate so that board's proven path is untouched.
+  void ubxSend(uint8_t cls, uint8_t id, const uint8_t* payload, uint16_t len) {
+    if (!_gps_serial) return;
+    uint8_t hdr[6] = { 0xB5, 0x62, cls, id, (uint8_t)(len & 0xFF), (uint8_t)(len >> 8) };
+    uint8_t a = 0, b = 0;
+    for (int i = 2; i < 6; ++i) { a += hdr[i]; b += a; }
+    for (uint16_t i = 0; i < len; ++i) { a += payload[i]; b += a; }
+    _gps_serial->write(hdr, sizeof hdr);
+    _gps_serial->write(payload, len);
+    _gps_serial->write(a);
+    _gps_serial->write(b);
+  }
+  static void aidPut32(uint8_t* p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
+
+  void sendAiding() {
+    bool sent = false;
+    // Only a time known to be right (NTP, GPS, the phone, or a hardware clock that
+    // kept it): the clock floor never reads below its seed or its saved floor, so
+    // after a power-off a plain "plausible" check passes a stale time, and a wrong
+    // time with a tight accuracy slows the first fix instead of speeding it.
+    const bool time_ok = _aid_time_ok && _aid_time_ok();
+    const uint32_t now = (time_ok && _clock) ? _clock->getCurrentTime() : 0;
+    if (now > 1700000000u) {
+      DateTime dt(now);
+      uint8_t t[24] = { 0 };
+      t[0] = 0x10;                          // type: TIME_UTC
+      t[2] = 0;                             // ref: none (no time pulse), applies on receipt
+      t[3] = (uint8_t)(int8_t)-128;         // leap seconds unknown
+      t[4] = dt.year() & 0xFF; t[5] = dt.year() >> 8;
+      t[6] = dt.month(); t[7] = dt.day(); t[8] = dt.hour(); t[9] = dt.minute(); t[10] = dt.second();
+      t[16] = 5;                            // tAccS: 5 s, generous for a small RTC
+      ubxSend(0x13, 0x40, t, sizeof t);
+      sent = true;
+    }
+    double la = 0, lo = 0;
+    const bool have_pos = _aid_pos && _aid_pos(&la, &lo) && la >= -90 && la <= 90 &&
+                          lo >= -180 && lo <= 180 && !(la == 0 && lo == 0);
+    if (have_pos) {
+      uint8_t p[20] = { 0 };
+      p[0] = 0x01;                          // type: POS_LLH
+      aidPut32(p + 4, (uint32_t)(int32_t)(la * 1e7));
+      aidPut32(p + 8, (uint32_t)(int32_t)(lo * 1e7));
+      aidPut32(p + 12, 0);                  // altitude 0 cm, covered by the accuracy below
+      aidPut32(p + 16, 10000000u);          // 100 km: the last position may be from elsewhere
+      ubxSend(0x13, 0x40, p, sizeof p);
+      sent = true;
+    }
+    if (sent) {
+      _gps_serial->flush();
+      Serial.printf("[GPS] cold start aided:%s%s\n", now > 1700000000u ? " time" : "",
+                    have_pos ? " position" : "");
+    }
+  }
+
   void noteValidSentence() {
     if (!_probe_serial || _stream_locked) return;
     _stream_locked = true;
@@ -179,6 +242,15 @@ public:
   // u-blox receivers without an enable line: rest in software standby rather than with the
   // GNSS engine stopped (see ubxGnss). Opt-in per board, once its module is known to wake.
   void setUbxStandby(bool on) { _ubx_standby = on; }
+
+  // Opt-in cold-start aiding: where the node last was, and whether the clock can
+  // be trusted. Sent ~3 s after begin(), once the receiver is listening. For
+  // boards that cut the GNSS rail (T-Deck Pro/Max) and therefore cold-start on
+  // every saver wake; a board that only stops the engine keeps its ephemeris and
+  // has no use for this. u-blox only -- UBX-MGA-INI is ignored by other makes.
+  void setAidSource(bool (*pos)(double* lat, double* lon), bool (*time_ok)()) {
+    _aid_pos = pos; _aid_time_ok = time_ok;
+  }
 
   // Override the enable pin's active level at runtime (e.g. once the hardware
   // revision is known). Re-drives the pin so an already-running GPS stays on and an
@@ -251,6 +323,13 @@ public:
     // and the start until sentences flow again.
     _wake_tries = 0;
     _wake_check_ms = _pin_en == -1 ? millis() + WAKE_CHECK_MS : 0;
+    // Aiding is for a receiver that just lost its ephemeris: on a rail-cut board
+    // begin() IS a cold start. The module needs about a second before it listens,
+    // and at boot the stored position is only loaded a moment after the GPS starts.
+    if (_aid_pos || _aid_time_ok) {
+      _aid_at = millis() + 3000;
+      if (!_aid_at) _aid_at = 1;
+    }
   }
 
   void reset() override {
@@ -362,6 +441,8 @@ public:
         }
       }
     }
+
+    if (_aid_at && (int32_t)(millis() - _aid_at) >= 0) { _aid_at = 0; sendAiding(); }
 
     if (_wake_check_ms && (int32_t)(millis() - _wake_check_ms) >= 0) {
       // A sentence from inside this last window, not any byte: the tail of what a stopping

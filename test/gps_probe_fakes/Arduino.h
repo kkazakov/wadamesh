@@ -21,6 +21,15 @@ inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
 inline int digitalRead(int) { return 0; }
 
+// The cold-start aiding path logs through Serial. These tests assert on the UART
+// bytes and the clock, not on the log, so a sink is enough.
+struct FakeSerial {
+  size_t printf(const char*, ...) { return 0; }
+  size_t print(const char*) { return 0; }
+  size_t println(const char*) { return 0; }
+};
+static FakeSerial Serial;
+
 class Stream {
 public:
   virtual ~Stream() {}
