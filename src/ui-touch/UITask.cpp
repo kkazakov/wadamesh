@@ -216,7 +216,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #if defined(HAS_PAGER_KEYBOARD)
     #include "../helpers/input/PagerKeyboard.h"
   #endif
-  #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+  #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
     #include <esp_wifi.h>              // esp_wifi_set_ps: deeper modem sleep while the screen is off
   #endif
   #if defined(TLORA_PAGER)
@@ -81760,7 +81760,7 @@ static inline void touchScreenBacklight(bool on) {
 // stops listening to the mesh — we just stop burning 240 MHz to render nothing.
 // Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
 // switches when the target changes (the call is a hard DFS switch).
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
 // A joined Wi-Fi is the largest draw after the backlight: with the screen
 // dark and no app connected, let the modem sleep through more beacons (maximum
 // modem sleep: it wakes every listen interval instead of every DTIM). Still
@@ -81774,9 +81774,28 @@ static void pagerWifiPsUpdate(int screen_on) {
   static int8_t s_applied = -1;          // 1 = MAX_MODEM, 0 = MIN_MODEM, -1 = not set
   if (screen_on >= 0) s_screen_on = screen_on != 0;
   if (WiFi.getMode() == WIFI_OFF) { s_applied = -1; return; }
-  const int8_t deep = (!s_screen_on && the_mesh.getProtoNumClients() == 0) ? 1 : 0;
+#if defined(HAS_WIO_TRACKER_L2)
+  // Only touch PS while associated: modem sleep on an unassociated STA naps
+  // through the setup wizard's scan dwell ("no networks found" -- the reason
+  // main.cpp defers WiFi.setSleep until after association), and MAX_MODEM only
+  // buys anything on a joined link. main.cpp owns the one-shot DTIM enable at
+  // association; after a link loss the next poll re-applies from scratch.
+  if (WiFi.status() != WL_CONNECTED) { s_applied = -1; return; }
+  // Opt-in like the GNSS rail cut and the panel sleep: the Battery saver toggle
+  // is the master switch for the whole regime. Saver off = the plain DTIM
+  // modem sleep (MIN_MODEM) main.cpp set at association, exactly as before.
+  const bool park = touchSleep::enabled() && !s_screen_on && the_mesh.getProtoNumClients() == 0;
+#else
+  const bool park = !s_screen_on && the_mesh.getProtoNumClients() == 0;
+#endif
+  const int8_t deep = park ? 1 : 0;
   if (deep == s_applied) return;
-  if (esp_wifi_set_ps(deep ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM) == ESP_OK) s_applied = deep;
+  if (esp_wifi_set_ps(deep ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM) == ESP_OK) {
+    s_applied = deep;
+#if defined(HAS_WIO_TRACKER_L2)
+    Serial.printf("[wio-l2] wifi ps: %s\n", deep ? "MAX_MODEM (parked)" : "MIN_MODEM (DTIM)");
+#endif
+  }
 }
 #endif
 
@@ -81792,7 +81811,7 @@ static void setCpuForScreen(bool screen_on) {
   setCpuFrequencyMhz(want);
   s_cur_mhz = want;
 #endif
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
   pagerWifiPsUpdate(screen_on);
 #endif
 }
@@ -86422,6 +86441,27 @@ void UITask::loop() {
   // redraws it into the shadow buffer (takeFullRepaint is armed by the WS server).
   if (g_web_mirror.active() && g_web_mirror.takeFullRepaint())
     lv_obj_invalidate(lv_scr_act());
+#endif
+#if defined(HAS_WIO_TRACKER_L2) && !defined(WADA_WEB)
+  // Idle Wi-Fi/BLE power policy (battery plan option 3). The Pager/M9 poll this
+  // from their keyboard-drain branches; this touch-only board has no such
+  // branch, so poll here on the common path. Once a second, catch clients
+  // coming/going and saver toggles between screen transitions: parked (screen
+  // dark, no app, on battery, Battery saver on) -> Wi-Fi MAX_MODEM + stretched
+  // BLE advertising; any activity reverses both within the same second.
+  // tsScreenOff() excludes the lit screensaver -- it animates, so the device
+  // is not parked while it is up.
+  {
+    static uint32_t s_idle_ps_ms = 0;
+    if (now - s_idle_ps_ms >= 1000) {
+      s_idle_ps_ms = now;
+      pagerWifiPsUpdate(-1);
+      const bool idle = touchSleep::enabled() && tsScreenOff() &&
+                        the_mesh.getProtoNumClients() == 0 && tsOnBattery();
+      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
+        mt->setBleIdleAdvertising(idle);
+    }
+  }
 #endif
 #if !CAP_EPAPER
   // Dark screen: stop rendering into a panel nobody can see. Pause LVGL's

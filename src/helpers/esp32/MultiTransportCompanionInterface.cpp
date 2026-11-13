@@ -298,6 +298,7 @@ void MultiTransportCompanionInterface::enableBle() {
     _ble.begin(_ble_prefix, name, _ble_pin_code);
     NimBLEDevice::setMTU(MAX_FRAME_SIZE + 3);   // see beginBle(): ATT payload is MTU-3
     _ble_begun = true;
+    _ble_idle_adv = false;   // fresh stack advertises at the normal interval
   }
   _ble_enabled = true;
   wifiConfigSetBleEnabled(true);    // persist so it survives reboot
@@ -337,6 +338,36 @@ void MultiTransportCompanionInterface::setBlePhoneLinkPaused(bool paused) {
   if (!_ble_begun || !_ble_enabled) return;   // nothing advertising; enable paths check the flag
   if (paused) _ble.disable();   // stop advertising and drop the phone
   else        _ble.enable();
+}
+
+// Battery-saver idle policy (battery plan option 3): parked with no app
+// connected, the phone link only needs to stay discoverable, not instantly
+// connectable -- stretch the advertising interval to 1-2 s so the BT
+// controller wakes far less often. The interval lives in the persistent
+// NimBLEAdvertising object, so the core's disconnect-restart path
+// (SerialBLEInterface::startAdvertising -> start()) picks it up unchanged.
+// Active restores 0/0 -- the host default the core's begin() leaves, i.e.
+// exactly the normal rate. A new interval only takes effect at the next
+// advertising start, so restart it when the state flips mid-advertisement.
+// Never stop advertising outright here, and never disableBle() -- that can
+// deinit NimBLE entirely.
+void MultiTransportCompanionInterface::setBleIdleAdvertising(bool idle) {
+  if (!_ble_begun || !_ble_enabled || _ble_phone_paused) return;   // nothing advertising / keyboard mode owns the radio
+  if (idle == _ble_idle_adv) return;                               // steady state: no NimBLE calls at all
+  // While a phone is linked, advertising is stopped anyway. Stretching can
+  // wait until the link drops (the next poll re-checks); restoring now means
+  // the post-disconnect restart advertises at the normal rate right away.
+  if (idle && _ble.isConnected()) return;
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  if (idle) {
+    adv->setMinInterval(1600);   // 0.625 ms units: 1 s ...
+    adv->setMaxInterval(3200);   // ... 2 s between advertising events
+  } else {
+    adv->setMinInterval(0);      // 0 = host default: the rate the core has
+    adv->setMaxInterval(0);      // always advertised at (begin() sets none)
+  }
+  _ble_idle_adv = idle;
+  if (adv->isAdvertising()) { adv->stop(); adv->start(); }
 }
 
 void MultiTransportCompanionInterface::disableBle() {
@@ -515,6 +546,7 @@ void MultiTransportCompanionInterface::restoreAfterHttpOta() {
     ble_name[sizeof(ble_name) - 1] = '\0';
     _ble.begin(_ble_prefix, ble_name, _ble_pin_code);
     _ble_begun = true;
+    _ble_idle_adv = false;   // fresh stack advertises at the normal interval
     _ble_enabled = _ota_ble_was_enabled;
     if (_ble_enabled && !_ble_phone_paused) _ble.enable();
     _ota_ble_released = false;
