@@ -62618,7 +62618,17 @@ static void docCaptureTour() {
 // Not while the screensaver is up: it reports the screen as off (for input), but it
 // is lit and animating, and light-sleeping would freeze it mid-frame.
 static bool tsScreenOff()  { return g_lv.task && g_lv.task->isScreenOff() && !s_ssaver_on; }
-static bool tsNoClient()   { return the_mesh.getProtoNumClients() == 0 && !g_usb_files_owns_serial; }   // public accessor (proto_num_clients is private)
+// True when no companion app is connected RIGHT NOW. getProtoNumClients() is a
+// since-boot registry of client identities (only ever incremented, reset in the
+// MyMesh constructor), so once any app has connected it stays >0 until reboot
+// and can never gate an idle policy. The transport's isConnected() checks the
+// live USB/BLE/TCP/WS links instead (USB counts only once a client actually
+// speaks). Shared by the TouchSleep gate and the Wio L2 idle Wi-Fi/BLE policy.
+static bool noLiveCompanionClient() {
+  BaseSerialInterface* si = g_lv.task ? g_lv.task->serialInterface() : nullptr;
+  return !(si && si->isConnected());
+}
+static bool tsNoClient()   { return noLiveCompanionClient() && !g_usb_files_owns_serial; }
 // tsWifiOff: true only when the WiFi radio is actually powered off. The question
 // the gate is asking is "is the modem drawing power", and WiFi.getMode() answers
 // exactly that — WIFI_OFF means esp_wifi is stopped. (WiFi.status() != WL_CONNECTED,
@@ -81760,17 +81770,6 @@ static inline void touchScreenBacklight(bool on) {
 // stops listening to the mesh — we just stop burning 240 MHz to render nothing.
 // Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
 // switches when the target changes (the call is a hard DFS switch).
-#if defined(HAS_WIO_TRACKER_L2) && !defined(WADA_WEB)
-// True when no companion app is connected RIGHT NOW. getProtoNumClients() is a
-// since-boot registry of client identities (only ever incremented, reset in the
-// MyMesh constructor), so once any app has connected it stays >0 until reboot
-// and cannot gate an idle policy. The transport's isConnected() checks the live
-// USB/BLE/TCP/WS links instead (USB counts only once a client actually speaks).
-static bool noLiveCompanionClient() {
-  BaseSerialInterface* si = g_lv.task ? g_lv.task->serialInterface() : nullptr;
-  return !(si && si->isConnected());
-}
-#endif
 #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)) && !defined(WADA_WEB)
 // A joined Wi-Fi is the largest draw after the backlight: with the screen
 // dark and no app connected, let the modem sleep through more beacons (maximum
