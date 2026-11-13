@@ -43,6 +43,17 @@ EnvironmentSensorManager sensors(gps);
 
 bool radio_init() {
   fallback_clock.begin();
+  // No enable or reset line on this board, so the provider's stop() cannot cut
+  // power. It already sends UBX-CFG-RST (controlled GNSS stop/start), which
+  // leaves the receiver powered and drawing a fraction of its tracking current.
+  // Software standby (UBX-RXM-PMREQ, backup, no time limit) drops that to tens of
+  // uA with only the RTC and backup RAM up, and keeps ephemeris and time, so the
+  // next begin() is a hot start of a second or two rather than a cold search.
+  // wakeupSources is uartrx: any byte we send wakes it, and begin()'s nudge does.
+  // Same opt-in the Pager's MIA-M10Q uses and was verified on. A receiver that
+  // does not speak UBX ignores the binary message, so a unit without a u-blox
+  // module behaves exactly as it did before.
+  gps.setUbxStandby(true);
   Wire.begin(18, 8);
   // A DS3231 fitted to this bus, if there is one. This is NOT the generic
   // address probe the comment below warns about: it is a declared chip type at
