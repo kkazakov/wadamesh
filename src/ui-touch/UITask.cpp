@@ -6726,6 +6726,7 @@ static uint32_t s_nav_last_key  = 0;
 static bool     s_nav_last_pressed = false;   // the last transition handed to LVGL
 static uint32_t s_nav_hold_key  = 0;          // a key held down on purpose (the Pager's Enter): reads pressed until its release
 static lv_indev_t* s_nav_indev  = nullptr;    // the keypad indev this FIFO feeds
+static lv_indev_t* s_touch_indev = nullptr;   // the physical touchscreen indev; null on keypad-only boards
 
 static inline void navFifoPush(uint32_t key, bool pressed) {
   uint8_t nxt = (uint8_t)((s_nav_fifo_head + 1) % 64);
@@ -80257,7 +80258,8 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_lv.indev_drv.type    = LV_INDEV_TYPE_POINTER;
       g_lv.indev_drv.read_cb = lvglTouchRead;
       g_lv.indev_drv.disp    = lv_disp_get_default();
-      if (!lv_indev_drv_register(&g_lv.indev_drv)) pushDiagLine("LVGL indev failed");
+      if (lv_indev_t* tp = lv_indev_drv_register(&g_lv.indev_drv)) s_touch_indev = tp;
+      else pushDiagLine("LVGL indev failed");
     }
 #endif
 
@@ -86355,6 +86357,36 @@ void UITask::loop() {
     }
   }
 #endif
+  // Dark screen: slow the physical touch indev's read timer. LVGL keeps reading it
+  // at LV_INDEV_DEF_READ_PERIOD (15 ms) with nothing on the glass, and on the
+  // inline-poll boards every read is a real bus transaction: the Wio L2 and the
+  // CrowPanel 3.5 share I2C0 between the GT911 and the expander/ADC, so they
+  // deliberately never start the background poll task (see the touch-init branch)
+  // and heltecV4CapTouchSetSlowPoll() has no task to throttle there. ~67 reads/s
+  // for nothing. 50 ms cuts that by two thirds and is the period the V4-R8's poll
+  // task already uses while dark. Deliberately not slower: wake is driven from
+  // this read (lvglTouchRead -> noteUserInput), so a tap must still overlap a poll
+  // or it is missed entirely and the screen stays dark under the finger.
+  // Only the physical touch indev is touched -- the web mirror's pointer must stay
+  // responsive, and the keypad indev costs no bus. Opt-in with the Battery saver,
+  // like the render pause above. E-paper is included: its glass stays visible, but
+  // these reads are still idle work while the device is parked.
+  {
+    static constexpr uint32_t kTouchDarkReadMs = 50;
+    static bool s_touch_slow = false;
+    const bool off = g_lv.ready && g_lv.task && g_lv.task->isScreenOff();
+#if !defined(HAS_TANMATSU)
+    const bool dark = off && !s_ssaver_on && !g_web_mirror.active() && touchSleep::enabled();
+#else
+    const bool dark = off && !s_ssaver_on && touchSleep::enabled();
+#endif
+    if (dark != s_touch_slow) {
+      s_touch_slow = dark;
+      if (s_touch_indev && s_touch_indev->driver && s_touch_indev->driver->read_timer)
+        lv_timer_set_period(s_touch_indev->driver->read_timer,
+                            dark ? kTouchDarkReadMs : (uint32_t)LV_INDEV_DEF_READ_PERIOD);
+    }
+  }
   uiCp("ui:lvgl");
 #if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
   const uint32_t lv_next_ms = lv_timer_handler();
