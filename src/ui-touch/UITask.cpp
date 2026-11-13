@@ -14250,6 +14250,15 @@ static lv_anim_enable_t tabSwitchAnim(int idx) {
   (void)idx;
   return LV_ANIM_OFF;
 #else
+  // Battery saver (Settings > Battery, or the Control Center chip) cuts the slide
+  // too: an instant jump skips the 200-400 ms of full-screen redraw frames on a
+  // device the user already asked to run lean. This is the one choke point for
+  // every animated tab/screen switch (goToTab + homeTileCb: home tiles, the Home
+  // "Unread" widget, swipe-back, function keys), so all of them go at once. The
+  // slide is LVGL's speed-based content scroll, not the tabview anim_time style,
+  // so LV_ANIM_OFF here is the only thing that removes it. Read live (a static
+  // bool) so flipping the saver applies on the next switch, like the aurora gate.
+  if (touchSleep::enabled()) return LV_ANIM_OFF;
   return idx == MAP_TAB_INDEX ? LV_ANIM_OFF : uiAnimOn();
 #endif
 }
