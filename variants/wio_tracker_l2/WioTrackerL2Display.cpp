@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "TouchSleep.h"   // touchSleep::enabled() -- the Battery saver gates panel sleep
+
 namespace {
 constexpr uint8_t kLightAddress = 0x2C;
 constexpr uint8_t kLightUpdate = 0x0F;
@@ -155,11 +157,13 @@ void WioTrackerL2Display::setDisplayRotation(uint8_t rotation) {
 // behind the dark glass: panel drive current for nothing, and the same
 // crystal-bias burn-in risk the ST7789/ST7796 boards fixed with SLPIN.
 // Sleep the panel too, and wake it BEFORE lighting it so no stale frame
-// flashes while the booster settles.
+// flashes while the booster settles. Panel sleep is part of the Battery
+// saver (opt-in): with the saver off the panel keeps refreshing behind the
+// dark backlight and wake is instant, exactly as before.
 void WioTrackerL2Display::setBrightness(uint8_t brightness) {
   if (brightness == 0) {
     _lcd.setBrightness(0);
-    if (!_panelAsleep) {
+    if (touchSleep::enabled() && !_panelAsleep) {
       _panel.setSleep(true);          // SLPIN: stop oscillator/booster/LC drive
       _panelAsleep = true;
       _sleepInMs = millis();

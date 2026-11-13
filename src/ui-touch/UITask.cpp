@@ -86423,13 +86423,15 @@ void UITask::loop() {
   // only the render+flush work stops. E-paper is excluded: its glass stays
   // visible with the front light off, and the lock screen deliberately
   // repaints while "off" (TDeckProDisplay::refreshWhileAsleep).
+  // Gated on the Battery saver (opt-in): with the saver off the panel keeps
+  // refreshing behind the dark backlight and wake is instant, as before.
   {
     static bool s_refr_paused = false;
     const bool off = g_lv.ready && g_lv.task && g_lv.task->isScreenOff();
 #if !defined(HAS_TANMATSU)
-    const bool dark = off && !s_ssaver_on && !g_web_mirror.active();
+    const bool dark = off && !s_ssaver_on && !g_web_mirror.active() && touchSleep::enabled();
 #else
-    const bool dark = off && !s_ssaver_on;
+    const bool dark = off && !s_ssaver_on && touchSleep::enabled();
 #endif
     if (dark != s_refr_paused) {
       const bool resuming = s_refr_paused && !dark;
