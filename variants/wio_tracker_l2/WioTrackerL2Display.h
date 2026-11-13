@@ -51,4 +51,7 @@ private:
   lgfx::LGFX_Device _lcd;
   bool _isOn = false;
   uint16_t _color = 0xFFFF;
+  bool _panelAsleep = false;   // NV3031B SLPIN state: screen off is more than backlight off
+  uint32_t _sleepInMs = 0;     // millis() at SLPIN, for the 120 ms bus-quiet window
+  void panelWake();            // SLPOUT + datasheet settle, taken before the backlight lights
 };

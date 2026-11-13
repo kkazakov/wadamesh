@@ -86231,6 +86231,40 @@ void UITask::loop() {
   if (g_web_mirror.active() && g_web_mirror.takeFullRepaint())
     lv_obj_invalidate(lv_scr_act());
 #endif
+#if !CAP_EPAPER
+  // Dark screen: stop rendering into a panel nobody can see. Pause LVGL's
+  // display refresh timer while the screen is truly off -- not the lit
+  // screensaver (it animates), not the web mirror (it streams the rendered
+  // frames). The input-read and user timers keep running inside
+  // lv_timer_handler, so touch/button wake and app logic are unaffected;
+  // only the render+flush work stops. E-paper is excluded: its glass stays
+  // visible with the front light off, and the lock screen deliberately
+  // repaints while "off" (TDeckProDisplay::refreshWhileAsleep).
+  {
+    static bool s_refr_paused = false;
+    const bool off = g_lv.ready && g_lv.task && g_lv.task->isScreenOff();
+#if !defined(HAS_TANMATSU)
+    const bool dark = off && !s_ssaver_on && !g_web_mirror.active();
+#else
+    const bool dark = off && !s_ssaver_on;
+#endif
+    if (dark != s_refr_paused) {
+      const bool resuming = s_refr_paused && !dark;
+      s_refr_paused = dark;
+      lv_timer_t* rt = _lv_disp_get_refr_timer(nullptr);
+      if (rt) {
+        if (dark) lv_timer_pause(rt);
+        else      lv_timer_resume(rt);
+      }
+      // A panel that slept behind a dark backlight can come back with stale
+      // or lost frame RAM (the ST7796 Pager saw corrupted bands after wake),
+      // and nothing rendered while the timer was paused. Repaint everything
+      // on resume so wake always shows the current screen -- the same
+      // full-frame wake the Pager does in touchScreenBacklight().
+      if (resuming && g_lv.ready) lv_obj_invalidate(lv_scr_act());
+    }
+  }
+#endif
   uiCp("ui:lvgl");
 #if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
   const uint32_t lv_next_ms = lv_timer_handler();
