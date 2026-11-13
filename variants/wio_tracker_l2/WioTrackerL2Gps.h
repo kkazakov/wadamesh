@@ -7,18 +7,26 @@
 // WHY: this board wires no GPIO enable/reset line to the GNSS module — GPS_EN
 // and GPS_RESET both resolve to -1 — so the core begin()/stop() are pin no-ops
 // and the module keeps drawing full tracking current while the GPS saver
-// (Settings > GPS > Save battery, and the battery saver) reports "resting".
-// The rail IS switchable, but until now only WioTrackerL2Board::powerOff()
-// used it. begin()/stop() are the choke point every GPS on/off path goes
-// through (boot initBasicGPS, the Settings toggle, the companion "gps" var,
-// the saver's rest/wake), so the rail follows the logical GPS state here —
-// no shared-code #ifdef, the quirk stays in the variant.
+// reports "resting". The rail IS switchable, but until now only
+// WioTrackerL2Board::powerOff() used it. begin()/stop() are the choke point
+// every GPS on/off path goes through (boot initBasicGPS, the Settings toggle,
+// the companion "gps" var, the saver's rest/wake) — no shared-code #ifdef, the
+// quirk stays in the variant.
 //
-// Trade-off: a rail cut loses the module's ephemeris, so every saver wake is a
-// cold start (tens of seconds to minutes under open sky). gpsSaverTick's search
-// windows (10 min before the first fix, 3 min after) already cover that. No
-// start command is needed after power-up — the module streams NMEA on its own
-// — so there is no lost-start failure mode and no boot delay is added here.
+// GATE: cutting the rail is part of the Battery saver (opt-in), mirroring the
+// panel-sleep gate in WioTrackerL2Display. With the saver OFF, stop() leaves
+// the module powered exactly as before — GPS off/on stays warm (fast re-fix)
+// but draws current; with it ON, stop() cuts the rail so "resting" truly
+// powers the module down. This keys on the Battery saver only: GPS > Save
+// battery alone still rests the receiver but does NOT cut the rail. begin()
+// always powers the rail — GPS cannot start without it.
+//
+// Trade-off (saver on): a rail cut loses the module's ephemeris, so every
+// saver wake is a cold start (tens of seconds to minutes under open sky).
+// gpsSaverTick's search windows (10 min before the first fix, 3 min after)
+// already cover that. No start command is needed after power-up — the module
+// streams NMEA on its own — so there is no lost-start failure mode and no boot
+// delay is added here.
 //
 // UART pins are tri-stated while the rail is off: a driven TX idles HIGH and
 // would back-power the unpowered module through its RX ESD diode (the same
@@ -29,6 +37,7 @@
 #include <Arduino.h>
 #include "helpers/sensors/MicroNMEALocationProvider.h"
 #include "WioTrackerL2Io.h"
+#include "TouchSleep.h"   // touchSleep::enabled() -- the Battery saver gates the rail cut
 
 class WioTrackerL2GpsProvider : public MicroNMEALocationProvider {
 public:
@@ -49,6 +58,11 @@ public:
 
   void stop() override {
     MicroNMEALocationProvider::stop();
+    // Rail cutting is part of the Battery saver (opt-in): with the saver off
+    // the module stays powered when GPS stops, exactly as before (warm, fast
+    // re-enable, but drawing current). With it on, cut the rail so "resting"
+    // truly powers the module down.
+    if (!touchSleep::enabled()) return;
     // Tri-state before the rail goes: never drive TX HIGH into an unpowered
     // module. RX is an input, but park it too (M9 precedent).
     pinMode(PIN_GPS_TX, INPUT);
