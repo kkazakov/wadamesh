@@ -31,10 +31,13 @@
 // UART pins are tri-stated while the rail is off: a driven TX idles HIGH and
 // would back-power the unpowered module through its RX ESD diode (the same
 // failure the ThinkNode M9 path in WadaNmeaLocationProvider documents).
-// NAMING TRAP: Arduino setPins(rx, tx) — PIN_GPS_TX=18 is the pin WE RECEIVE
-// ON; PIN_GPS_RX=17 is our TX (confirmed by the bring-up probe, platformio.ini).
+// NAMING TRAP: three different pin orders meet here. Arduino setPins(rx, tx)
+// and IDF uart_set_pin(port, tx, rx, ...) are opposites — PIN_GPS_TX=18 is the
+// pin WE RECEIVE ON (ESP RX); PIN_GPS_RX=17 is our TX (ESP TX), confirmed by
+// the bring-up probe (platformio.ini).
 
 #include <Arduino.h>
+#include <driver/uart.h>   // uart_set_pin: re-route TX after stop() detached it (see begin)
 #include "helpers/sensors/MicroNMEALocationProvider.h"
 #include "WioTrackerL2Io.h"
 #include "TouchSleep.h"   // touchSleep::enabled() -- the Battery saver gates the rail cut
@@ -49,9 +52,19 @@ public:
     // level. Reset is parked released (LOW) by WioTrackerL2Io::begin(), so a
     // restored rail is a clean power-on reset.
     (void)WioTrackerL2Io::setGnssPower(true);
-    // Re-attach the UART after stop() tri-stated it. Same pins/order as
-    // initBasicGPS() and gpsEnsureBigRxRing(); Serial1 is already begun.
-    _serial.setPins(PIN_GPS_TX, PIN_GPS_RX);
+    // Re-attach the UART after stop() tri-stated it. NOT HardwareSerial::setPins:
+    // on arduino-esp32 2.0.17 uartSetPins() only (re)attaches a pin that DIFFERS
+    // from the one it recorded, and these pins never change — so setPins() here
+    // is a no-op. But stop()'s pinMode(PIN_GPS_RX, INPUT) re-selects the GPIO17
+    // pad's IOMUX function to plain GPIO (MCU_SEL 2=U1TXD -> 1=GPIO; GPIO17 is
+    // U1TXD's native IOMUX pin, so it routes via the pad, not the GPIO matrix),
+    // disconnecting our TX. Without a real re-route TX stays a floating input for
+    // the rest of the session (RX keeps working, so NMEA still arrives and the gap
+    // hides). uart_set_pin() re-selects the pad back to U1TXD and restores a driven,
+    // idle-HIGH output. Verified on the board: pad MCU_SEL 2->1 on stop, 1->2 on
+    // begin. Serial1 is UART_NUM_1 here (HardwareSerial(1)); IDF order is (tx, rx):
+    // PIN_GPS_RX=17 is our TX, PIN_GPS_TX=18 our RX.
+    uart_set_pin(UART_NUM_1, PIN_GPS_RX, PIN_GPS_TX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     MicroNMEALocationProvider::begin();
     Serial.println("[wio-l2] GNSS rail on");
   }
@@ -64,7 +77,9 @@ public:
     // truly powers the module down.
     if (!touchSleep::enabled()) return;
     // Tri-state before the rail goes: never drive TX HIGH into an unpowered
-    // module. RX is an input, but park it too (M9 precedent).
+    // module. RX is an input, but park it too (M9 precedent). Note pinMode(INPUT)
+    // on our TX (GPIO17) also re-selects the pad to plain GPIO, detaching U1TXD —
+    // begin() must re-route it with uart_set_pin(), not setPins() (see there).
     pinMode(PIN_GPS_TX, INPUT);
     pinMode(PIN_GPS_RX, INPUT);
     (void)WioTrackerL2Io::setGnssPower(false);
