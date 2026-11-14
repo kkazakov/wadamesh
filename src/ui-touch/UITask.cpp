@@ -62623,8 +62623,15 @@ static bool tsScreenOff()  { return g_lv.task && g_lv.task->isScreenOff() && !s_
 // since-boot registry of client identities (only ever incremented, reset in the
 // MyMesh constructor), so once any app has connected it stays >0 until reboot
 // and can never gate an idle policy. The transport's isConnected() checks the
-// live USB/BLE/TCP/WS links instead (USB counts only once a client actually
-// speaks). Shared by the TouchSleep gate and the Wio L2 idle Wi-Fi/BLE policy.
+// live links instead: BLE/TCP/WS reflect the current connection state.
+// USB CAVEAT: the core ArduinoSerialInterface::isConnected() returns _clientSeen,
+// set on the first frame a client sends and NEVER cleared — so USB counts as
+// connected from that first frame until reboot, not just while a client is active.
+// A user who once used the USB companion therefore blocks the idle park until
+// reboot. The gate's onBattery term usually masks this (a USB client implies USB
+// power), except on CAP_BATTERY 0 boards that park regardless. The core is upstream
+// libdeps, so the latch cannot be cleared here; documented, not worked around.
+// Shared by the TouchSleep gate and the idle Wi-Fi/BLE policy.
 static bool noLiveCompanionClient() {
   BaseSerialInterface* si = g_lv.task ? g_lv.task->serialInterface() : nullptr;
   return !(si && si->isConnected());
