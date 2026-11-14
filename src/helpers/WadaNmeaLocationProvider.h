@@ -27,6 +27,7 @@
 #include <helpers/RefCountedDigitalPin.h>
 #include "esp32/TouchPrefsStore.h"
 #include <limits.h>
+#include <cmath>   // NAN (course_deg when no course); not pulled in by every host fake
 
 class WadaNmeaLocationProvider : public LocationProvider {
   char _nmeaBuffer[100];
