@@ -20,6 +20,9 @@ struct RTCClock {
   uint32_t set_calls = 0;
   virtual ~RTCClock() {}
   virtual void setCurrentTime(uint32_t) { ++set_calls; }
+  // Real API (ArduinoHelpers/AutoDiscoverRTCClock): the cold-start aiding reads it.
+  // 0 keeps the aiding's "is this time trustworthy" threshold false in host tests.
+  virtual uint32_t getCurrentTime() { return 0; }
 };
 }  // namespace mesh
 
