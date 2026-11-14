@@ -325,7 +325,8 @@ static bool kbV4TextControl(const char* key) {
            strcmp(key, LV_SYMBOL_LEFT) == 0 || strcmp(key, " ") == 0 ||
            strcmp(key, LV_SYMBOL_RIGHT) == 0 ||
            strcmp(key, LV_SYMBOL_BACKSPACE) == 0 ||
-           strcmp(key, LV_SYMBOL_OK) == 0;
+           strcmp(key, LV_SYMBOL_OK) == 0 ||
+           strcmp(key, KB_LANG_KEY) == 0;   // the V4 has its floating language button
 }
 
 static bool kbV4InlinePunctuation(const char* key) {
@@ -1011,10 +1012,37 @@ const char* keyboardLayoutName(KeyboardLayoutId id) {
  * map is selected — they are file-static and there is exactly one keyboard. */
 static const char* s_live_lower[64];
 static const char* s_live_upper[64];
+// Control maps that go with the live maps when the language key is left out (only
+// English enabled): one entry fewer, the key's width handed to the space bar.
+static lv_btnmatrix_ctrl_t s_live_lower_ctrl[64];
+static lv_btnmatrix_ctrl_t s_live_upper_ctrl[64];
 static char     s_lang_code[8];
 static uint16_t s_lang_btn = 0xFFFF;
 
-static void kbCopyMapWithLang(const char* const* src, const char** dst, uint16_t* lang_btn) {
+static void kbCopyMapWithLang(const char* const* src, const char** dst, uint16_t* lang_btn,
+                              const lv_btnmatrix_ctrl_t* ctrl_src = nullptr,
+                              lv_btnmatrix_ctrl_t* ctrl_dst = nullptr) {
+    // With ctrl_src/ctrl_dst the language key is DROPPED instead of labelled (only
+    // English is enabled, so there is nothing to switch to) and its width goes to
+    // the key after it, the space bar, so the row keeps its proportions.
+    if (ctrl_src && ctrl_dst) {
+        uint16_t out = 0, ci = 0, co = 0;
+        lv_btnmatrix_ctrl_t carry = 0;
+        for (uint16_t n = 0; src[n] && src[n][0] != '\0' &&
+                             out + 1 < (uint16_t)(sizeof s_live_lower / sizeof s_live_lower[0]); ++n) {
+            if (strcmp(src[n], "\n") == 0) { dst[out++] = src[n]; continue; }
+            const lv_btnmatrix_ctrl_t c = ctrl_src[ci++];
+            if (strcmp(src[n], KB_LANG_KEY) == 0) { carry = c & 0x07; continue; }
+            lv_btnmatrix_ctrl_t w = (c & 0x07) + carry;
+            if (w > 7) w = 7;
+            ctrl_dst[co++] = (c & ~(lv_btnmatrix_ctrl_t)0x07) | w;
+            carry = 0;
+            dst[out++] = src[n];
+        }
+        dst[out] = nullptr;
+        *lang_btn = 0xFFFF;
+        return;
+    }
     uint16_t n = 0;     // index in the map array (separators included)
     uint16_t btn = 0;   // index among the keys only — what lv_btnmatrix reports
     // Both terminators are in use: the modern maps end with "" (LVGL's own style,
@@ -1071,13 +1099,21 @@ void keyboardLayoutsApply(lv_obj_t* keyboard, KeyboardLayoutId id) {
 #else
   snprintf(s_lang_code, sizeof s_lang_code, "%s", lo.name);
   uint16_t lower_lang_btn = 0xFFFF;
-  kbCopyMapWithLang(lo.lower_map, s_live_lower, &lower_lang_btn);
-  kbCopyMapWithLang(lo.upper_map, s_live_upper, &s_lang_btn);   // same cell index in both
   // NOT const: LVGL keeps the pointer in its global kb_map[] and reads it back on
   // every mode switch, so these buffers are the maps for as long as the layout is
   // active (see the s_live_* comment above).
-  lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER, const_cast<const char**>(s_live_lower), lo.lower_ctrl);
-  lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_UPPER, const_cast<const char**>(s_live_upper), lo.upper_ctrl);
+  if (keyboardLayoutsAnySecondary()) {
+    kbCopyMapWithLang(lo.lower_map, s_live_lower, &lower_lang_btn);
+    kbCopyMapWithLang(lo.upper_map, s_live_upper, &s_lang_btn);   // same cell index in both
+    lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER, const_cast<const char**>(s_live_lower), lo.lower_ctrl);
+    lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_UPPER, const_cast<const char**>(s_live_upper), lo.upper_ctrl);
+  } else {
+    // Only English: no language key at all, the space bar takes its room.
+    kbCopyMapWithLang(lo.lower_map, s_live_lower, &lower_lang_btn, lo.lower_ctrl, s_live_lower_ctrl);
+    kbCopyMapWithLang(lo.upper_map, s_live_upper, &s_lang_btn, lo.upper_ctrl, s_live_upper_ctrl);
+    lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER, const_cast<const char**>(s_live_lower), s_live_lower_ctrl);
+    lv_keyboard_set_map(keyboard, LV_KEYBOARD_MODE_TEXT_UPPER, const_cast<const char**>(s_live_upper), s_live_upper_ctrl);
+  }
 #endif
 }
 

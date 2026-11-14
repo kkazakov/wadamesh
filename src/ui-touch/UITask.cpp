@@ -10677,6 +10677,10 @@ static void kbLangBtnRefresh() {
 static void kbLangKeyCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   lv_obj_t* kb = lv_event_get_target(e);
+  // The key only exists on the letter pages: on "1#" the same index is another key
+  // (space, OK, an arrow), which must keep doing its own job.
+  const lv_keyboard_mode_t mode = lv_keyboard_get_mode(kb);
+  if (mode != LV_KEYBOARD_MODE_TEXT_LOWER && mode != LV_KEYBOARD_MODE_TEXT_UPPER) return;
   if (!keyboardLayoutsIsLangKey(lv_btnmatrix_get_selected_btn(kb))) return;
   lv_event_stop_processing(e);
   const KeyboardLayoutId before = keyboardLayoutsGetCurrent();
