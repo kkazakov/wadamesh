@@ -86,8 +86,8 @@ USB) and the [GitHub releases](https://github.com/ALLFATHER-BV/wadamesh/releases
   cold-boot sync offered on T-Deck is available in Clock settings. New in beta_38;
   report anything that feels off.
 - **T-Display P4**: touch UI with the on-screen keyboard. The BOOT button toggles
-  the screen — a tap wakes it (or lights the lock screen) and a tap on a lit
-  screen sleeps it — and holding it for two seconds locks or unlocks, as the Wio
+  the screen: a tap wakes it (or lights the lock screen) and a tap on a lit
+  screen sleeps it. Holding it for two seconds locks or unlocks, as the Wio
   Tracker L2's wake button does; "Lock when screen off" is
   under Settings, Lock screen. The optional clip-on
   keyboard expansion can be attached or removed while running and is picked up

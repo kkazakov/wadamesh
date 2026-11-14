@@ -47,12 +47,6 @@ EnvironmentSensorManager sensors(gps);
 bool radio_init() {
   fallback_clock.begin();
 
-  pinMode(PIN_TOUCH_SDA, INPUT);
-  pinMode(PIN_TOUCH_SCL, INPUT);
-  delayMicroseconds(50);
-  int lvl_sda = digitalRead(PIN_TOUCH_SDA);
-  int lvl_scl = digitalRead(PIN_TOUCH_SCL);
-
   // I2C bus recovery: if a peripheral is mid-byte and holding SDA low, clock SCL
   // up to 9 times so it can finish, then leave the lines idle-high.
   pinMode(PIN_TOUCH_SCL, OUTPUT);
