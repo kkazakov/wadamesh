@@ -26141,12 +26141,21 @@ static uint16_t batteryMvSampled() {
     // GPIO8 (DONE#), not inferred from voltage steps. Only snap s_ema when the
     // charger state changes so a >70 mV IR sag during a +22 dBm LoRa TX burst
     // is smoothed by the EMA instead of snapping downward to raw.
+    // Snap again 3 s after a flip, when the rail has settled (pulled out of the
+    // charger it dips below the cell for a moment): the same rule as the tested
+    // M9BatterySmoother in M9Board.h, so the 3 s republish in batteryMvSmoothed()
+    // shows the settled cell and not an EMA still crawling up from the dip.
     static int s_ext_prev = -2;
+    static unsigned long s_flip_ms = 0;
+    const unsigned long now_ms = millis();
     const int ext_now = ((board.externalPowerPresent() & 1) << 2) | (board.isCharging() & 3);
     const bool charge_flip = (s_ext_prev != -2 && ext_now != s_ext_prev);
     s_ext_prev = ext_now;
-    if (charge_flip) s_ema = (float)raw;
-    else             s_ema += d * 0.15f;           // ~7-sample time constant
+    const bool settle_due = s_flip_ms && !charge_flip && (unsigned long)(now_ms - s_flip_ms) >= 3000UL;
+    if (charge_flip) s_flip_ms = now_ms ? now_ms : 1UL;
+    else if (settle_due) s_flip_ms = 0;
+    if (charge_flip || settle_due) s_ema = (float)raw;
+    else                           s_ema += d * 0.15f;   // ~7-sample time constant
 #else
     // A charger plug/unplug steps the rail ~100 mV+ — snap straight to it so the
     // charge state is recognized within a tick instead of crawling there over
