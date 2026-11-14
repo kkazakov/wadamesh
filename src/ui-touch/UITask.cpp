@@ -63602,7 +63602,9 @@ static void chatHeaderApply(bool chat_open) {
     if (!s_hdr_was_two_row) {
       lv_obj_set_size(g_statusbar.left_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
       lv_label_set_long_mode(g_statusbar.left_label, LV_LABEL_LONG_WRAP);
+#if !CAP_ROUND_CORNERS   // round-cornered boards pack their row with statusBarPackRound (never two-row)
       if (g_statusbar.gps_icon) statusBarPackRight();
+#endif
     }
     s_hdr_was_two_row = true;
     const lv_coord_t row_h = STATUSBAR_H;
