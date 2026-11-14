@@ -41,6 +41,10 @@ public:
   void writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels);
   void setDisplayRotation(uint8_t rotation);
   void setBrightness(uint8_t brightness);
+  // True while the NV3031B is in SLPIN (Battery saver screen-off). The UI reads this
+  // to repaint the current screen into GRAM BEFORE lighting the backlight on wake,
+  // so no pre-sleep frame flashes. False with the saver off (panel never sleeps).
+  bool panelIsAsleep() const { return _panelAsleep; }
   bool getTouchPoint(uint16_t& x, uint16_t& y);
 
 private:
@@ -53,5 +57,5 @@ private:
   uint16_t _color = 0xFFFF;
   bool _panelAsleep = false;   // NV3031B SLPIN state: screen off is more than backlight off
   uint32_t _sleepInMs = 0;     // millis() at SLPIN, for the 120 ms bus-quiet window
-  void panelWake();            // SLPOUT + datasheet settle, taken before the backlight lights
+  void panelWake();            // post-SLPIN quiet window + LovyanGFX SWRESET/re-init, before the backlight lights
 };

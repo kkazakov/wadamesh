@@ -81764,9 +81764,26 @@ static inline void touchScreenBacklight(bool on) {
     ledcWrite(kM9BlPwmChannel, 255);   // inverted: 255 = 0% conduction = off
     touchPanelSleep(true);
   }
-#elif defined(HAS_WIO_TRACKER_L2) || defined(HAS_CROWPANEL_35) || defined(HAS_CROWPANEL_50) || defined(HAS_CROWPANEL_P4_101) || \
+#elif defined(HAS_WIO_TRACKER_L2)
+  // The display owns its backlight (I2C). With the Battery saver on, screen-off also
+  // puts the NV3031B in SLPIN (variant setBrightness). On wake, repaint the CURRENT
+  // screen into GRAM BEFORE lighting the backlight: the first flush wakes the panel
+  // (writePixelsRGB565 -> panelWake) and lands a fresh frame, so no pre-sleep frame
+  // flashes while the booster settles — the same wake order the Pager uses. Gated on
+  // the variant's panelIsAsleep() so with the saver off (panel never sleeps) wake is
+  // instant, exactly as before, and no extra full-frame render is added.
+  if (on) {
+    if (display.panelIsAsleep() && g_lv.ready) {
+      lv_obj_invalidate(lv_scr_act());
+      lv_refr_now(nullptr);
+    }
+    applyBrightness(s_brightness_pct);
+  } else {
+    display.setBrightness(0);
+  }
+#elif defined(HAS_CROWPANEL_35) || defined(HAS_CROWPANEL_50) || defined(HAS_CROWPANEL_P4_101) || \
       defined(HAS_SENSECAP_INDICATOR)
-  // The display owns its backlight (I2C on Wio and the CrowPanel 5.0, PWM on the 3.5,
+  // The display owns its backlight (I2C on the CrowPanel 5.0, PWM on the 3.5,
   // LEDC on the Indicator).
   if (on) applyBrightness(s_brightness_pct);
   else    display.setBrightness(0);
