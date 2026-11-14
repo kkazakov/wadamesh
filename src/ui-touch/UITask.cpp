@@ -2956,7 +2956,7 @@ static inline lv_coord_t statusBarCurH() { return s_statusbar_tall ? (lv_coord_t
 static inline bool sbTwoRow() {
 #if defined(HAS_TDECK_PRO)
   return true;
-#elif defined(HELTEC_LORA_V4_TFT)
+#elif CAP_TWO_ROW_BAR_PORTRAIT
   return lv_disp_get_hor_res(nullptr) < lv_disp_get_ver_res(nullptr);
 #else
   return false;
@@ -58999,7 +58999,7 @@ static void openControlCenter() {
   // screen can't fit the battery/IP beside the clock, so portrait stacks the
   // header vertically and uses a taller card.
   const bool portrait = (sw < sh);
-#if defined(HELTEC_LORA_V4_TFT)
+#if CAP_TWO_ROW_BAR_PORTRAIT
   // V4 portrait has no room for the battery row and the Expansion Kit env line above
   // the chips; both are elsewhere (status bar battery, Sensors tab / Home widget). #833
   const bool cc_lean = portrait;
@@ -62988,7 +62988,7 @@ static void buildGlobalStatusBar() {
   lv_obj_add_event_cb(g_statusbar.chat_head, channelGearCb, LV_EVENT_CLICKED, nullptr);
   #if defined(HAS_TDECK_PRO)
   g_statusbar.chat_avatar = makeGlyphAvatar(g_statusbar.root, "", GLYPH_SQUARE, 20);   // fits the 22 px second row
-#elif defined(HELTEC_LORA_V4_TFT)
+#elif CAP_TWO_ROW_BAR_PORTRAIT
   // Fits the portrait second row (one bar row high).
   g_statusbar.chat_avatar = makeGlyphAvatar(g_statusbar.root, "", GLYPH_SQUARE, LV_MIN(SC(26), STATUSBAR_H - 2));
 #else
@@ -63790,7 +63790,7 @@ static uint32_t s_sb_pack_sig = 0;   // what the last pack saw; the clock's over
 // The bar shows no node name, so the clock holds the far left corner on every page,
 // an open chat included (the icons keep their places).
 static bool sbProClockLeft() { return true; }
-#elif defined(HELTEC_LORA_V4_TFT)
+#elif CAP_TWO_ROW_BAR_PORTRAIT
 // The same in portrait, the 240 px two-row bar (#833): centred, the clock met the
 // icons there and the overlap guard's step left lifted it off the top of the screen.
 static bool sbProClockLeft() { return sbTwoRow(); }
@@ -64088,7 +64088,7 @@ static void updateGlobalStatusBar() {
     if (!chat_hdr) sbAlign(g_statusbar.left_label, LV_ALIGN_CENTER, 0, 0);
 #endif
   } else {
-#if defined(HAS_TDECK_PRO) || defined(HELTEC_LORA_V4_TFT)
+#if defined(HAS_TDECK_PRO) || CAP_TWO_ROW_BAR_PORTRAIT
     // The clock holds the left corner: the left zone (the unread count) follows it.
     lv_coord_t lx = 6;
     if (sbProClockLeft() && (!s_statusbar_tall || chat_open) && g_statusbar.clock &&
@@ -64597,7 +64597,7 @@ static void updateGlobalStatusBar() {
     mixText(g_statusbar.ble_icon);   // Bluetooth vs the wider keyboard glyph
     mixText(g_statusbar.gps_icon);   // crosshair vs pin
     static uint32_t s_clk_sig = 0;
-#if defined(HAS_TDECK_PRO) || defined(HELTEC_LORA_V4_TFT)
+#if defined(HAS_TDECK_PRO) || CAP_TWO_ROW_BAR_PORTRAIT
     mix(sbProClockLeft());
     if (sbProClockLeft()) {
       if (sig != s_clk_sig && visible(g_statusbar.clock)) {
