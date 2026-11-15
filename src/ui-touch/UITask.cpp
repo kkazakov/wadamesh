@@ -86560,6 +86560,13 @@ void UITask::loop() {
       // full-frame wake the Pager does in touchScreenBacklight().
       if (resuming && g_lv.ready) lv_obj_invalidate(lv_scr_act());
     }
+#if defined(HAS_WIO_TRACKER_L2)
+    // lv_refr_now() bypasses the paused refresh timer, so a background flush
+    // (writePixelsRGB565 -> panelWake) can wake the panel while parked. Re-assert
+    // SLPIN every parked loop; no-op once asleep. A glance clears _screen_off, so
+    // `dark` is false during it and this never fights the deliberate wake paint.
+    if (dark) display.panelSleepEnsure();
+#endif
   }
 #endif
   // Dark screen: slow the physical touch indev's read timer. LVGL keeps reading it

@@ -163,14 +163,23 @@ void WioTrackerL2Display::setDisplayRotation(uint8_t rotation) {
 void WioTrackerL2Display::setBrightness(uint8_t brightness) {
   if (brightness == 0) {
     _lcd.setBrightness(0);
-    if (touchSleep::enabled() && !_panelAsleep) {
-      _panel.setSleep(true);          // SLPIN: stop oscillator/booster/LC drive
-      _panelAsleep = true;
-      _sleepInMs = millis();
-    }
+    panelSleepEnsure();
   } else {
     panelWake();
     _lcd.setBrightness(brightness);
+  }
+}
+
+// SLPIN if the saver is on and the panel is awake. Idempotent: once asleep it does
+// nothing (no bus traffic). Called from setBrightness(0) and, every parked loop, from
+// the UI render-pause block — because lv_refr_now() bypasses the paused refresh timer
+// and a background flush (writePixelsRGB565 -> panelWake) would otherwise leave the
+// panel refreshing behind a dark backlight for the rest of the session.
+void WioTrackerL2Display::panelSleepEnsure() {
+  if (touchSleep::enabled() && !_panelAsleep) {
+    _panel.setSleep(true);          // SLPIN: stop oscillator/booster/LC drive
+    _panelAsleep = true;
+    _sleepInMs = millis();
   }
 }
 
