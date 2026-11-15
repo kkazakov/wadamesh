@@ -4,6 +4,19 @@
 #include <Arduino.h>
 
 #include "WioTrackerL2Io.h"
+#include "helpers/BatteryOcv.h"
+
+// Measured OCV curve for the L2's 3000 mAh pack, 10% steps (100%..0%). Ships
+// in Meshtastic's seeed_wio_tracker_L2 variant (OCV_ARRAY) for this same
+// board. The linear map it replaces rushed the top third of the discharge
+// (4180->3864 mV read as 98->63%) and then stalled on the plateau. Overrides
+// the weak default in src/helpers/BatteryOcv.cpp.
+const uint16_t* boardBatteryOcvTable() {
+  static const uint16_t k_ocv[BATTERY_OCV_POINTS] = {
+    4180, 4040, 3864, 3800, 3745, 3710, 3687, 3663, 3623, 3482, 3300
+  };
+  return k_ocv;
+}
 
 void WioTrackerL2Board::begin() {
   ESP32Board::begin();
@@ -32,7 +45,15 @@ bool WioTrackerL2Board::ensureBatteryAdc() {
   if (!WioTrackerL2Io::ready() || !WioTrackerL2Io::setBatterySense(true)) return false;
   delay(10);
   _batteryAdcReady = _batteryAdc.begin(0x48, &Wire);
-  if (_batteryAdcReady) _batteryAdc.setGain(GAIN_TWO);
+  // GAIN_ONE (±4.096 V), not GAIN_TWO (±2.048 V): the pack sits behind a 2:1
+  // divider, so a full 4.2 V cell puts 2.10 V on AIN0 — past GAIN_TWO's full
+  // scale. The ADC saturates at 32767 there, clipping every pack voltage above
+  // ~4.096 V to it: the top of the charge was invisible, "calibrate full"
+  // stored the clip, and the charger rail could never cross the charge-detect
+  // threshold (full + 50 mV), so the board never showed a charging icon.
+  // Meshtastic's seeed_wio_tracker_L2 variant runs GAIN_ONE on this same
+  // divider. Resolution is still 125 µV/LSB = 0.25 mV at the pack.
+  if (_batteryAdcReady) _batteryAdc.setGain(GAIN_ONE);
   (void)WioTrackerL2Io::setBatterySense(false);
   if (!_batteryAdcReady) _nextBatteryProbeMs = now + 15000;
   return _batteryAdcReady;

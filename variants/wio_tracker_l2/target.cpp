@@ -2,6 +2,7 @@
 #include <Arduino.h>
 
 #include "target.h"
+#include "WioTrackerL2Gps.h"
 
 WioTrackerL2Board board;
 
@@ -13,11 +14,22 @@ ESP32RTCClock fallback_clock;
 ClockFloorRTC rtc_clock(fallback_clock);
 
 #if ENV_INCLUDE_GPS
-MicroNMEALocationProvider gps(Serial1, &rtc_clock);
+// Rail-switching provider: the core one is a pin no-op here (no GPS_EN/RESET),
+// so the GPS saver's "rest" never powered the module down. See WioTrackerL2Gps.h.
+WioTrackerL2GpsProvider gps(Serial1, &rtc_clock);
 EnvironmentSensorManager sensors(gps);
 #else
 EnvironmentSensorManager sensors;
 #endif
+
+// GPS-off rail cut, called from gpsSaverTick's GPS-off branch (mirrors the Pager's
+// tloraPagerGpsPowerDown). Defined unconditionally so the symbol exists even on a
+// GPS-less build; a no-op there.
+void wioTrackerL2GpsPowerDown() {
+#if ENV_INCLUDE_GPS
+  gps.powerDown();
+#endif
+}
 
 WioTrackerL2Display display;
 MomentaryButton user_btn(PIN_USER_BTN, 1000, true);

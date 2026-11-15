@@ -4,6 +4,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 
+#include "TouchSleep.h"   // touchSleep::enabled() -- the Battery saver gates panel sleep
+
 namespace {
 constexpr uint8_t kLightAddress = 0x2C;
 constexpr uint8_t kLightUpdate = 0x0F;
@@ -103,6 +105,7 @@ bool WioTrackerL2Display::begin() {
   Wire.begin(47, 48, 100000);
   _lcd.setSwapBytes(true);
   _lcd.setRotation(0);
+  _panelAsleep = false;   // init() leaves the panel awake (SLPOUT then DISPON)
   _lcd.setBrightness(160);
   _lcd.fillScreen(0);
   setLogicalSize(_lcd.width(), _lcd.height());
@@ -111,8 +114,8 @@ bool WioTrackerL2Display::begin() {
   return true;
 }
 
-void WioTrackerL2Display::turnOn() { if (!_isOn) { _lcd.setBrightness(160); _isOn = true; } }
-void WioTrackerL2Display::turnOff() { if (_isOn) { _lcd.setBrightness(0); _isOn = false; } }
+void WioTrackerL2Display::turnOn() { if (!_isOn) { setBrightness(160); _isOn = true; } }
+void WioTrackerL2Display::turnOff() { if (_isOn) { setBrightness(0); _isOn = false; } }
 void WioTrackerL2Display::clear() { _lcd.fillScreen(0); }
 void WioTrackerL2Display::startFrame(ColorVal bkg) { _lcd.fillScreen(bkg); }
 void WioTrackerL2Display::setTextSize(int sz) { _lcd.setTextSize(sz); }
@@ -127,6 +130,11 @@ void WioTrackerL2Display::endFrame() {}
 
 void WioTrackerL2Display::writePixelsRGB565(int x, int y, int w, int h, const uint16_t* pixels) {
   if (!_isOn || !pixels || w <= 0 || h <= 0) return;
+  // A deliberate paint while the panel sleeps must land in GRAM: the message
+  // glance paints BEFORE the backlight comes on (no stale-frame flash), and
+  // screenshots force lv_refr_now. Wake first. Idle-dark rendering never gets
+  // here -- the UI pauses LVGL's refresh timer while the screen is off.
+  panelWake();
   _lcd.startWrite();
   _lcd.setAddrWindow(x, y, w, h);
   _lcd.writePixels(const_cast<uint16_t*>(pixels), (uint32_t)w * h);
@@ -143,8 +151,66 @@ void WioTrackerL2Display::setDisplayRotation(uint8_t rotation) {
   setLogicalSize(_lcd.width(), _lcd.height());
 }
 
+// Screen off on this board is brightness 0 (touchScreenBacklight -> here);
+// every wake goes through applyBrightness -> here with a non-zero value.
+// Backlight off alone leaves the NV3031B refreshing the same static image
+// behind the dark glass: panel drive current for nothing, and the same
+// crystal-bias burn-in risk the ST7789/ST7796 boards fixed with SLPIN.
+// Sleep the panel too, and wake it BEFORE lighting it so no stale frame
+// flashes while the booster settles. Panel sleep is part of the Battery
+// saver (opt-in): with the saver off the panel keeps refreshing behind the
+// dark backlight and wake is instant, exactly as before.
 void WioTrackerL2Display::setBrightness(uint8_t brightness) {
-  _lcd.setBrightness(brightness);
+  if (brightness == 0) {
+    _lcd.setBrightness(0);
+    panelSleepEnsure();
+  } else {
+    panelWake();
+    _lcd.setBrightness(brightness);
+  }
+}
+
+// SLPIN if the saver is on and the panel is awake. Idempotent: once asleep it does
+// nothing (no bus traffic). Called from setBrightness(0) and, every parked loop, from
+// the UI render-pause block — because lv_refr_now() bypasses the paused refresh timer
+// and a background flush (writePixelsRGB565 -> panelWake) would otherwise leave the
+// panel refreshing behind a dark backlight for the rest of the session.
+void WioTrackerL2Display::panelSleepEnsure() {
+  if (touchSleep::enabled() && !_panelAsleep) {
+    _panel.setSleep(true);          // SLPIN: stop oscillator/booster/LC drive
+    _panelAsleep = true;
+    _sleepInMs = millis();
+  }
+}
+
+// Two waits, only one of them ours:
+// 1) The NV3031B needs >=120 ms of bus quiet after SLPIN before the next command.
+//    The wake's first command is SWRESET (see below), which the datasheet forbids
+//    right after SLPIN, so that window is enforced here — not at sleep time, so
+//    going dark never blocks; a wake right after sleep pays the remainder.
+// 2) LovyanGFX 1.2.27 Panel_NV3031B::setSleep(false) is NOT a bare SLPOUT: it sends
+//    SWRESET, waits CMD_RST_DELAY (120 ms), replays the full init table (which
+//    itself carries SLPOUT + 100 ms, then DISPON) and restores MADCTL
+//    (Panel_NV3031B.cpp). So the panel already settles >=220 ms inside the call —
+//    no extra delay is needed here. The old delay(120) after it was redundant and
+//    pushed the wake to ~340 ms; it is gone (measured ~220 ms on the board).
+//    LovyanGFX uses SWRESET to cure a 1-pixel column shift that otherwise appears
+//    after a bare SLPOUT. GRAM content survives sleep, but the UI still repaints the
+//    whole screen on off->on because nothing rendered while the refresh timer was
+//    paused — the repaint shows the CURRENT screen, not a stale one. All of this runs
+//    with the backlight still off.
+// KNOWN RESIDUAL: the SWRESET power-on sequence still produces a brief blink/flash on
+//    wake (seen on the board even with the backlight off and a fresh frame repainted
+//    first). It is inherent to LovyanGFX's SWRESET wake; curing it fully would need a
+//    bare SLPOUT (risking the column shift) or DISPON gated until after the frame is
+//    written. Left as-is: the repaint-before-backlight order in touchScreenBacklight
+//    already removes the worse stale-frame flash.
+void WioTrackerL2Display::panelWake() {
+  if (!_panelAsleep) return;
+  const uint32_t since = millis() - _sleepInMs;
+  if (since < 120) delay(120 - since);
+  _panel.setSleep(false);             // SWRESET + re-init (SLPOUT/DISPON), settles internally
+  _panelAsleep = false;
 }
 
 bool WioTrackerL2Display::getTouchPoint(uint16_t& x, uint16_t& y) {
