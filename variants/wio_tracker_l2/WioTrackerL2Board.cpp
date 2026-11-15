@@ -4,6 +4,19 @@
 #include <Arduino.h>
 
 #include "WioTrackerL2Io.h"
+#include "helpers/BatteryOcv.h"
+
+// Measured OCV curve for the L2's 3000 mAh pack, 10% steps (100%..0%). Ships
+// in Meshtastic's seeed_wio_tracker_L2 variant (OCV_ARRAY) for this same
+// board. The linear map it replaces rushed the top third of the discharge
+// (4180->3864 mV read as 98->63%) and then stalled on the plateau. Overrides
+// the weak default in src/helpers/BatteryOcv.cpp.
+const uint16_t* boardBatteryOcvTable() {
+  static const uint16_t k_ocv[BATTERY_OCV_POINTS] = {
+    4180, 4040, 3864, 3800, 3745, 3710, 3687, 3663, 3623, 3482, 3300
+  };
+  return k_ocv;
+}
 
 void WioTrackerL2Board::begin() {
   ESP32Board::begin();

@@ -280,6 +280,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #include <helpers/sensors/LPPDataHelpers.h>
   #include <helpers/TouchDiagTrace.h>
   #include <helpers/BufferedFileCommit.h>   // "Save update bin to SD": write after download, retry whole file (#734)
+  #include "../helpers/BatteryOcv.h"        // QUOTED: this tree's helper; OCV curve + the weak per-board table hook
   #if defined(ESP32)
     #include <Preferences.h>
     #include <helpers/esp32/SdNvsPrefs.h>   // NVS-or-SD prefs backend (Launcher-safe)
@@ -26188,7 +26189,11 @@ static uint16_t s_batt_full_mv = 0;
 static bool     s_batt_full_loaded = false;
 static uint16_t batteryFullMv() {
   if (!s_batt_full_loaded) { s_batt_full_mv = touchPrefsGetBattFullMv(); s_batt_full_loaded = true; }
-  return s_batt_full_mv ? s_batt_full_mv : 4200;
+  if (s_batt_full_mv) return s_batt_full_mv;
+  // Uncalibrated: a board with a measured OCV table uses its own 100% point
+  // (the L2 pack rests at 4.18 V, not 4.20); the rest keep the Li-ion default.
+  if (const uint16_t* ocv = boardBatteryOcvTable()) return ocv[0];
+  return 4200;
 }
 
 #if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9)
@@ -26364,11 +26369,16 @@ static int batteryPercentFromMv(uint16_t mv) {
     if (soc >= 0) return soc;
   }
 #endif
-  // Li-ion curve: 3.30 V empty, FULL = the calibrated full (default 4.20 V).
-  // While charging the rail reads above full (charger-driven) — cap at 100
-  // rather than show a bogus number; the real cell % isn't observable here.
+  // Voltage -> % for the gauge-less boards. While charging the rail reads
+  // above full (charger-driven) — cap at 100 rather than show a bogus number;
+  // the real cell % isn't observable here.
   if (mv == 0) return -1;
   const uint16_t full = batteryFullMv();
+  // A board with a measured discharge curve interpolates it (see BatteryOcv.h
+  // for why linear cannot work). The rest keep the legacy linear map —
+  // 3.30 V empty, FULL = the calibrated full — until a table is measured.
+  if (const uint16_t* ocv = boardBatteryOcvTable())
+    return batteryOcvPercent(mv, ocv, BATTERY_OCV_POINTS, full);
   if (mv >= full)  return 100;
   if (mv <= 3300)  return 0;
   return (int)((mv - 3300) * 100 / (full - 3300));
