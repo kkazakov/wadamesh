@@ -46,6 +46,17 @@ EnvironmentSensorManager sensors(gps);
 
 bool radio_init() {
   fallback_clock.begin();
+  // No enable or reset line on this board, so the provider's stop() cannot cut
+  // power. It already sends UBX-CFG-RST (controlled GNSS stop/start), which
+  // leaves the receiver powered and drawing a fraction of its tracking current.
+  // Software standby (UBX-RXM-PMREQ, backup, no time limit) drops that to tens of
+  // uA with only the RTC and backup RAM up, and keeps ephemeris and time, so the
+  // next begin() is a hot start of a second or two rather than a cold search.
+  // wakeupSources is uartrx: any byte we send wakes it, and begin()'s nudge does.
+  // Same opt-in the Pager's MIA-M10Q uses and was verified on. A receiver that
+  // does not speak UBX ignores the binary message, so a unit without a u-blox
+  // module behaves exactly as it did before.
+  gps.setUbxStandby(true);
 
   // I2C bus recovery: if a peripheral is mid-byte and holding SDA low, clock SCL
   // up to 9 times so it can finish, then leave the lines idle-high.
