@@ -59,6 +59,12 @@ public:
   // touched, so switching back resumes the phone link as it was.
   void setBlePhoneLinkPaused(bool paused);
   bool isBlePhoneLinkPaused() const { return _ble_phone_paused; }
+  // Battery-saver idle policy: stretch the phone-link advertising interval
+  // while parked so the BT controller wakes less often; restore the normal
+  // interval on activity. Never stops advertising, never touches the saved
+  // on/off intent or the bond state, and leaves keyboard mode (phone link
+  // paused) alone. Safe to call every second; acts only on a change.
+  void setBleIdleAdvertising(bool idle);
 #if defined(HAS_TDISPLAY_P4) && !TDP4_C6_HOSTED
   // T-Display P4: the factory C6 ESP-AT firmware has its BLE advertising commands stubbed
   // (BLEADVDATA/ADVSTART all ERROR — Meck-P4 hit the same wall and ships Wi-Fi companion), and
@@ -162,6 +168,7 @@ private:
   SerialBLEInterface _ble;
   bool _ble_begun;    // beginBle() was called
   bool _ble_phone_paused = false;   // keyboard mode: no phone link, stack still up
+  bool _ble_idle_adv = false;       // setBleIdleAdvertising(): stretched interval applied
   bool _ble_enabled;  // user has BLE on (toggle via UI)
   bool _ota_ble_released;
   bool _ota_ble_was_enabled;

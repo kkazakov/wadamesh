@@ -44,6 +44,13 @@ bool enabled();
 
 void loopEnd(uint32_t now_ms);    // call at the very END of the main loop()
 
+// ISR-safe nudge to wake a parked loop early (e.g. a wake-button press on the
+// expander INT). Pass a pointer to a BaseType_t that receives the
+// higher-priority-task-woken flag; call portYIELD_FROM_ISR with it afterwards.
+// The park is a notification-wait with the throttle as timeout, so this wakes it
+// immediately without shortening the idle sleep. No-op if not parked / no task.
+void wakeFromISR(void* higher_prio_task_woken);
+
 // instrumentation (read by the settings / diag UI)
 bool       isSleeping();          // currently in the asleep regime
 uint32_t   wakeCount();           // cumulative meaningful wakes
