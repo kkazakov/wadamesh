@@ -26196,8 +26196,11 @@ static uint16_t batteryFullMv() {
   return 4200;
 }
 
-#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9)
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)
 // (R8 & M9: the divider is permanently connected, so EMA smoothing filters ADC2/Wi-Fi jitter.)
+// (L2: the ADS1115 itself is quiet, but its 30 s cache can land mid-TX-burst at
+// +22 dBm; the EMA smooths the steps between cache updates instead of passing
+// each one straight to the readout.)
 // EMA + above-full voltage heuristic applies; threshold accuracy vs the
 // uncalibrated ADC_MULTIPLIER=5.07 conversion needs on-device confirmation.)
 // Per-board battery sampler: EMA over the noisy ADC so the value doesn't jitter
@@ -26233,11 +26236,22 @@ static uint16_t batteryMvSampled() {
     if (charge_flip || settle_due) s_ema = (float)raw;
     else                           s_ema += d * 0.15f;   // ~7-sample time constant
 #else
-    // A charger plug/unplug steps the rail ~100 mV+ — snap straight to it so the
+    // A charger plug-IN steps the rail ~100 mV+ up — snap straight to it so the
     // charge state is recognized within a tick instead of crawling there over
-    // the EMA. Smaller deltas are ADC noise, so keep smoothing those.
-    if (d > 70.0f || d < -70.0f) s_ema = (float)raw;
-    else                         s_ema += d * 0.15f;   // ~7-sample time constant
+    // the EMA. A step DOWN can be the charger coming off, or just a LoRa TX
+    // burst / screen-on sag: require it to persist 2.5 s before snapping and
+    // hold the EMA meanwhile, so a burst no longer drags the reading down and
+    // lets it crawl back (the sawtooth). A real unplug persists and snaps after
+    // the window — the same settle the M9 branch above uses. Smaller deltas are
+    // ADC noise, so keep smoothing those.
+    static unsigned long s_low_since = 0;
+    if (d > 70.0f) { s_ema = (float)raw; s_low_since = 0; }
+    else if (d < -70.0f) {
+      const unsigned long now_ms = millis();
+      if (!s_low_since) s_low_since = now_ms ? now_ms : 1UL;
+      if ((unsigned long)(now_ms - s_low_since) >= 2500UL) { s_ema = (float)raw; s_low_since = 0; }
+    }
+    else { s_low_since = 0; s_ema += d * 0.15f; }   // ~7-sample time constant
 #endif
   }
   return (uint16_t)(s_ema + 0.5f);
@@ -26334,13 +26348,14 @@ static uint16_t batteryMvSmoothed() {
   return s_pub;
 }
 
-static int batteryPercentFromMv(uint16_t mv);   // fwd decl (icon derives from %)
+static int batteryPercentFromMv(uint16_t mv);      // fwd decl (icon derives from %)
+static int batteryPercentPublished(uint16_t mv);   // fwd decl (ratcheted, below)
 static const char* batteryGlyphForMv(uint16_t mv) {
   if (mv == 0)               return LV_SYMBOL_BATTERY_EMPTY;
   if (batteryIsCharging(mv)) return LV_SYMBOL_CHARGE;   // on USB power
   // Derive the icon from the (calibrated) percent so custom packs whose full
   // voltage differs from 4.2 V still fill the icon at their real 100%.
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   if (pct >= 90) return LV_SYMBOL_BATTERY_FULL;
   if (pct >= 65) return LV_SYMBOL_BATTERY_3;
   if (pct >= 40) return LV_SYMBOL_BATTERY_2;
@@ -26384,6 +26399,29 @@ static int batteryPercentFromMv(uint16_t mv) {
   return (int)((mv - 3300) * 100 / (full - 3300));
 }
 
+// Published percent: the discharge ratchet. The raw curve % can rise when the
+// load drops (radio idle, screen off) and fall again on the next TX burst, so
+// the readout twitched up and down all day. While discharging, publish only
+// downward moves, and only once they are at least 2 points: in the flat part
+// of the curve a single point is a few mV, and rectifying that ADC noise into
+// the ratchet would drift the reading down while the device sits idle.
+// Charging follows the reading freely, and a charge-state flip re-seeds it.
+// The low-battery guard (pagerLowBatteryTick) keeps calling batteryPercentFromMv
+// directly: it must see the rail RECOVER after a transmit burst, which a
+// ratchet would hide.
+static int  s_batt_pub_pct = -1;
+static bool s_batt_pub_chg = false;
+static void batteryPercentReset() { s_batt_pub_pct = -1; }
+static int batteryPercentPublished(uint16_t mv) {
+  const int pct = batteryPercentFromMv(mv);
+  if (pct < 0) return pct;
+  const bool chg = batteryIsCharging(mv);
+  if (s_batt_pub_pct < 0 || chg || chg != s_batt_pub_chg) s_batt_pub_pct = pct;
+  else if (pct <= s_batt_pub_pct - 2)                     s_batt_pub_pct = pct;
+  s_batt_pub_chg = chg;
+  return s_batt_pub_pct;
+}
+
 // Calibrate-battery action (Device settings). SHORT_CLICKED captures the current
 // voltage as the new 100%; LONG_PRESSED resets to the default Li-ion curve. Same
 // on V4 + T-Deck. SHORT_CLICKED (not CLICKED) so a long-press to reset doesn't
@@ -26393,6 +26431,7 @@ static void calibrateBatteryCb(lv_event_t* e) {
   if (code == LV_EVENT_LONG_PRESSED) {
     touchPrefsSetBattFullMv(0);
     s_batt_full_mv = 0; s_batt_full_loaded = true;
+    batteryPercentReset();   // the curve moved: let the published % re-seed
     if (g_lv.task) g_lv.task->showAlert(TR("Battery calibration reset to default"), 2200);
     return;
   }
@@ -26408,6 +26447,7 @@ static void calibrateBatteryCb(lv_event_t* e) {
   }
   touchPrefsSetBattFullMv(mv);
   s_batt_full_mv = mv; s_batt_full_loaded = true;
+  batteryPercentReset();   // the curve moved: let the published % re-seed
   char b[72];
   snprintf(b, sizeof b, TR("Calibrated: 100%% = %u.%02u V  (long-press to reset)"),
            (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
@@ -26692,10 +26732,10 @@ static void batteryLogTick(uint32_t now_ms) {
   s_ma_sum = 0; s_ma_n = 0;
   if ((uint16_t)s_bday_today != s_bday_saved) battDaySave();   // at most once per log line
   battUseSave();
-  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv),
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentPublished(mv),
                    (uint16_t)getCpuFrequencyMhz(), has_ma, ma);
 #else
-  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv),
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentPublished(mv),
                    (uint16_t)getCpuFrequencyMhz());
 #endif
   hwBattPush((uint32_t)time(nullptr), mv);   // the Battery widget's last 24 h
@@ -28335,7 +28375,7 @@ static void webSendToChannel(int slot, const char* text) {
 static void webPushStatus() {
   if (!g_lv.task || !s_webdata_buf) return;
   uint16_t mv  = batteryMvSmoothed();
-  int      pct = batteryPercentFromMv(mv);
+  int      pct = batteryPercentPublished(mv);
   bool     wc  = (WiFi.status() == WL_CONNECTED);
   uint32_t clk = 0;
   auto* rtc = the_mesh.getRTCClock();
@@ -45566,7 +45606,7 @@ static void settingsCatValue(int c, char* out, size_t cap) {
 #if CAP_BATTERY
     case CAT_BATTERY: {
       const uint16_t mv = batteryMvSmoothed();
-      if (mv) snprintf(out, cap, "%d%%", batteryPercentFromMv(mv));
+      if (mv) snprintf(out, cap, "%d%%", batteryPercentPublished(mv));
       break;
     }
 #endif
@@ -53290,7 +53330,7 @@ static void lockscreenUpdateBattery() {
     if (strcmp(lv_label_get_text(s_lock_batt_gauge), t) != 0) lv_label_set_text(s_lock_batt_gauge, t);
   }
 #endif
-  const int pct = mv ? batteryPercentFromMv(mv) : -1;
+  const int pct = mv ? batteryPercentPublished(mv) : -1;
   const int key = (pct < 0 && !charging) ? -2 : (charging ? 1000 + LV_MAX(pct, 0) : pct);
   if (key == s_lock_batt_key) return;
   s_lock_batt_key = key;
@@ -59102,7 +59142,7 @@ static void openControlCenter() {
 
   // ---- Battery + Wi-Fi info (right) ----
   const uint16_t mv = batteryMvSmoothed();
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   char batt_s[28];
   if (batteryIsCharging(mv))
     snprintf(batt_s, sizeof batt_s, "%s  %u.%02uV", TR("Charging"),
@@ -64507,7 +64547,7 @@ static void updateGlobalStatusBar() {
   // ---- Battery ----
   const uint16_t mv = batteryMvSmoothed();
   const bool charging = batteryIsCharging(mv);
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   static int s_last_pct = -9999;
   static bool s_last_charging = false;
   if (pct != s_last_pct || charging != s_last_charging) {
@@ -66876,7 +66916,7 @@ static void hwBatteryUpdate(int i) {
   HwInst& w = hwI(i);
   const uint16_t mv = batteryMvSmoothed();
   const bool chg = mv && batteryIsCharging(mv);
-  const int pct = mv ? batteryPercentFromMv(mv) : -1;
+  const int pct = mv ? batteryPercentPublished(mv) : -1;
   HwFig* f = hwF(i);
   const uint32_t col = chg ? COLOR_HUE[HUE_DEVICE] : pct >= 0 && pct <= 15 ? COLOR_STATUS_DANGER_TEXT
                      : pct >= 0 && pct <= 30 ? COLOR_STATUS_WARN : COLOR_HUE[HUE_DEVICE];
@@ -76611,7 +76651,7 @@ uint8_t  luaHostRepeatHop(uint32_t fp, uint8_t idx, uint8_t* out, uint8_t cap) {
 void luaHostBattery(uint16_t* mv, int* pct, bool* charging) {
   const uint16_t v = batteryMvSmoothed();
   if (mv)       *mv = v;
-  if (pct)      *pct = batteryPercentFromMv(v);
+  if (pct)      *pct = batteryPercentPublished(v);
   if (charging) *charging = batteryIsCharging(v);
 }
 // wada.sys.gps(). False when there is no fix -- the caller then gets nil rather
@@ -82188,7 +82228,7 @@ static void ssaverBuildStatus(CstStatus& s, bool north_up) {
   }
   const uint16_t mv = batteryMvSmoothed();
   s.charging = mv && batteryIsCharging(mv);
-  s.batt = mv ? batteryPercentFromMv(mv) : -1;
+  s.batt = mv ? batteryPercentPublished(mv) : -1;
 #if defined(TLORA_PAGER)
   pagerGaugeNote(s.batt_note, sizeof s.batt_note);   // the screensaver runs while charging
 #endif
