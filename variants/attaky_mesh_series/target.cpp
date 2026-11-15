@@ -24,8 +24,14 @@ ESP32RTCClock fallback_clock;
 ClockFloorRTC        rtc_clock(fallback_clock);
 
 #if ENV_INCLUDE_GPS
-  #include <helpers/sensors/MicroNMEALocationProvider.h>
-  MicroNMEALocationProvider nmea = MicroNMEALocationProvider(Serial1, &rtc_clock);
+  #include "../../src/helpers/WadaNmeaLocationProvider.h"
+  // No GPS_EN/GPS_RESET line on this board, so the core provider's stop() is a pin
+  // no-op and the receiver kept drawing full tracking current through every rest
+  // of the GPS saver. The Wada provider sends UBX-CFG-RST (controlled GNSS
+  // stop/start) instead and retries the start until sentences flow again; a
+  // receiver that does not speak UBX ignores the binary message. Same UART/baud
+  // handling as before -- initBasicGPS() owns Serial1, no baud probe opted in.
+  WadaNmeaLocationProvider nmea = WadaNmeaLocationProvider(Serial1, &rtc_clock);
   EnvironmentSensorManager sensors = EnvironmentSensorManager(nmea);
 #else
   EnvironmentSensorManager sensors;
