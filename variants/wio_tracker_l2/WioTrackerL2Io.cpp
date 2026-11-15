@@ -3,6 +3,24 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include "TouchSleep.h"   // touchSleep::wakeFromISR — cut the idle park short on a wake press
+
+namespace {
+// TCA9535 INT (GPIO45) is open-drain, active-low, and asserts on any input-port
+// change — the wake button is bit 0. A falling edge means a press (or release)
+// happened; nudge the parked loop so the button is serviced now, not up to a
+// throttle period later (the missed-first-wake-press bug). The INT stays low until
+// the input register is read, which readWakeButton() does every loop, so it
+// re-arms for the next edge. ISR-safe: only gives a task notification.
+void IRAM_ATTR l2ExpanderIntISR() {
+  BaseType_t higher_prio_woken = pdFALSE;
+  touchSleep::wakeFromISR(&higher_prio_woken);
+  portYIELD_FROM_ISR(higher_prio_woken);
+}
+}  // namespace
 
 namespace {
 
@@ -139,6 +157,9 @@ bool begin() {
   s_ready = true;
   Serial.printf("[wio-l2] expander ready out=%02X/%02X cfg=%02X/%02X\n",
                 s_output[0], s_output[1], s_config[0], s_config[1]);
+  // Wake-on-press: the register reads above cleared any pending INT, so arm the
+  // falling edge now. GPIO45 is already INPUT_PULLUP (see above).
+  attachInterrupt(45, l2ExpanderIntISR, FALLING);
   return true;
 }
 
