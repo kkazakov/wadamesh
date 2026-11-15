@@ -81364,6 +81364,11 @@ static void gpsSaverTick(uint32_t now) {
   if (!on) {
 #if defined(TLORA_PAGER)
     tloraPagerGpsPowerDown();   // switched off: the module's rail too, not just its standby
+#elif defined(HAS_WIO_TRACKER_L2)
+    // Switched off: cut the GNSS rail too (saver-gated, idempotent). stop() alone misses
+    // this — initBasicGPS() runs it at boot before the saver pref loads, so the rail was
+    // left powered all session with GPS off. Mirrors the Pager branch above.
+    wioTrackerL2GpsPowerDown();
 #endif
     return;
   }

@@ -22,6 +22,15 @@ EnvironmentSensorManager sensors(gps);
 EnvironmentSensorManager sensors;
 #endif
 
+// GPS-off rail cut, called from gpsSaverTick's GPS-off branch (mirrors the Pager's
+// tloraPagerGpsPowerDown). Defined unconditionally so the symbol exists even on a
+// GPS-less build; a no-op there.
+void wioTrackerL2GpsPowerDown() {
+#if ENV_INCLUDE_GPS
+  gps.powerDown();
+#endif
+}
+
 WioTrackerL2Display display;
 MomentaryButton user_btn(PIN_USER_BTN, 1000, true);
 

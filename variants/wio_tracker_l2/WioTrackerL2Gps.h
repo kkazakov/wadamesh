@@ -52,6 +52,7 @@ public:
     // level. Reset is parked released (LOW) by WioTrackerL2Io::begin(), so a
     // restored rail is a clean power-on reset.
     (void)WioTrackerL2Io::setGnssPower(true);
+    _railOff = false;
     // Re-attach the UART after stop() tri-stated it. NOT HardwareSerial::setPins:
     // on arduino-esp32 2.0.17 uartSetPins() only (re)attaches a pin that DIFFERS
     // from the one it recorded, and these pins never change — so setPins() here
@@ -71,11 +72,18 @@ public:
 
   void stop() override {
     MicroNMEALocationProvider::stop();
-    // Rail cutting is part of the Battery saver (opt-in): with the saver off
-    // the module stays powered when GPS stops, exactly as before (warm, fast
-    // re-enable, but drawing current). With it on, cut the rail so "resting"
-    // truly powers the module down.
-    if (!touchSleep::enabled()) return;
+    powerDown();
+  }
+
+  // Idempotent rail cut for "GPS switched off". gpsSaverTick() calls this every loop
+  // while GPS is off (mirroring the Pager's tloraPagerGpsPowerDown), which covers the
+  // case stop() alone misses: initBasicGPS() runs stop() at boot BEFORE the saver pref
+  // loads in UITask::begin(), so the boot-time stop() sees the saver disabled and leaves
+  // the rail on — and gpsSaverTick's GPS-off branch never called stop() again. Gated on
+  // the saver: with it off the module stays powered (warm, fast re-enable). _railOff
+  // makes the per-loop call a no-op once the rail is down (no re-tri-state, no log spam).
+  void powerDown() {
+    if (!touchSleep::enabled() || _railOff) return;
     // Tri-state before the rail goes: never drive TX HIGH into an unpowered
     // module. RX is an input, but park it too (M9 precedent). Note pinMode(INPUT)
     // on our TX (GPIO17) also re-selects the pad to plain GPIO, detaching U1TXD —
@@ -83,9 +91,11 @@ public:
     pinMode(PIN_GPS_TX, INPUT);
     pinMode(PIN_GPS_RX, INPUT);
     (void)WioTrackerL2Io::setGnssPower(false);
+    _railOff = true;
     Serial.println("[wio-l2] GNSS rail off");
   }
 
 private:
   HardwareSerial& _serial;
+  bool _railOff = false;   // rail cut by powerDown(); begin() restores it
 };

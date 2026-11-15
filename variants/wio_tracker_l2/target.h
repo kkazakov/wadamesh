@@ -25,3 +25,4 @@ extern MomentaryButton user_btn;
 
 bool radio_init();
 mesh::LocalIdentity radio_new_identity();
+void wioTrackerL2GpsPowerDown();   // GPS rail off when switched off (saver-gated); begin() restores it
