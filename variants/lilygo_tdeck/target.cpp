@@ -52,6 +52,10 @@ bool radio_init() {
   // 38400" without ever getting a fix (#778). Standby is silent and wakes on any byte we
   // send, which the provider keeps doing until sentences flow. Receivers that do not
   // speak UBX ignore it. Runs before sensors.begin(), whose GPS detect ends in a stop().
+  // Concretely: UBX-RXM-PMREQ with backup mode and no time limit drops the draw to tens
+  // of uA with only the RTC and backup RAM up, and keeps ephemeris and time, so the next
+  // begin() is a hot start of a second or two rather than a cold search. wakeupSources is
+  // uartrx, and begin()'s nudge is the byte that wakes it.
   gps.setUbxStandby(true);
 
   // I2C bus recovery: if a peripheral is mid-byte and holding SDA low, clock SCL
