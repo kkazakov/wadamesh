@@ -38,6 +38,11 @@ namespace {
   bool         g_asleep_regime = false;
   uint32_t     g_cycle_count = 0;     // throttle cycles while parked (liveness counter)
   WakeReason   g_last_reason = WakeReason::None;
+  // The loop task, captured on first park so a board's wake ISR (e.g. the L2
+  // expander INT on a wake-button press) can cut the park short via a task
+  // notification. Only the loop task's notification is used here; the Lua audio
+  // worker owns its own task's notification, so there is no conflict.
+  TaskHandle_t g_park_task = nullptr;
 
   // -1 = the gate passes; otherwise the (int)Blocker holding it shut.
   int gateBlocker() {
@@ -96,11 +101,22 @@ void loopEnd(uint32_t now_ms) {
   const uint64_t t0 = esp_timer_get_time();
   TickType_t park_ticks = pdMS_TO_TICKS(park_ms);
   if (park_ticks == 0) park_ticks = 1;
-  vTaskDelay(park_ticks);
+  // Notification-wait instead of a plain vTaskDelay: a board wake source (the L2
+  // expander INT on a wake-button press) gives the notification and cuts the park
+  // short, so a button press is serviced immediately instead of up to THROTTLE_MS
+  // late — the missed-first-press bug. With no wake source it just times out like
+  // vTaskDelay, so the idle draw is unchanged. Still a scheduler block (idle task
+  // WFI), not light sleep — watchdog-safe.
+  g_park_task = xTaskGetCurrentTaskHandle();
+  const uint32_t notified = ulTaskNotifyTake(pdTRUE, park_ticks);
   g_acc_idle_us += (uint64_t)(esp_timer_get_time() - t0);
   g_cycle_count++;
-  g_last_reason = WakeReason::Timer;   // a throttle is a timed yield
+  g_last_reason = notified ? WakeReason::Button : WakeReason::Timer;
   g_last_check_us = esp_timer_get_time();
+}
+
+void wakeFromISR(void* higher_prio_task_woken) {
+  if (g_park_task) vTaskNotifyGiveFromISR(g_park_task, (BaseType_t*)higher_prio_task_woken);
 }
 
 bool       isSleeping()      { return g_asleep_regime; }   // true while parked/throttling
