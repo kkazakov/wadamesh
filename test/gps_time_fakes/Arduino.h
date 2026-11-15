@@ -22,6 +22,15 @@ inline void digitalWrite(int, int) {}
 inline int digitalRead(int) { return 0; }
 inline uint32_t trueUtc() { return g_utc_at_ms0 + g_test_ms / 1000; }
 
+// The cold-start aiding path logs through Serial. This test asserts on the clock,
+// not on the log, so a sink is enough (same shape as gps_probe_fakes/Arduino.h).
+struct FakeSerial {
+  size_t printf(const char*, ...) { return 0; }
+  size_t print(const char*) { return 0; }
+  size_t println(const char*) { return 0; }
+};
+static FakeSerial Serial;
+
 class Stream {
 public:
   virtual ~Stream() {}

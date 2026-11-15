@@ -224,7 +224,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #if defined(HAS_PAGER_KEYBOARD)
     #include "../helpers/input/PagerKeyboard.h"
   #endif
-  #if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+  #if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
     #include <esp_wifi.h>              // esp_wifi_set_ps: deeper modem sleep while the screen is off
   #endif
   #if defined(TLORA_PAGER)
@@ -288,6 +288,7 @@ static_assert(ChannelSenderSplit::kMaxWireName >= (size_t)UITask::MAX_SENDER_NAM
   #include <helpers/sensors/LPPDataHelpers.h>
   #include <helpers/TouchDiagTrace.h>
   #include <helpers/BufferedFileCommit.h>   // "Save update bin to SD": write after download, retry whole file (#734)
+  #include "../helpers/BatteryOcv.h"        // QUOTED: this tree's helper; OCV curve + the weak per-board table hook
   #if defined(ESP32)
     #include <Preferences.h>
     #include <helpers/esp32/SdNvsPrefs.h>   // NVS-or-SD prefs backend (Launcher-safe)
@@ -6775,6 +6776,7 @@ static uint32_t s_nav_last_key  = 0;
 static bool     s_nav_last_pressed = false;   // the last transition handed to LVGL
 static uint32_t s_nav_hold_key  = 0;          // a key held down on purpose (the Pager's Enter): reads pressed until its release
 static lv_indev_t* s_nav_indev  = nullptr;    // the keypad indev this FIFO feeds
+static lv_indev_t* s_touch_indev = nullptr;   // the physical touchscreen indev; null on keypad-only boards
 
 static inline void navFifoPush(uint32_t key, bool pressed) {
   uint8_t nxt = (uint8_t)((s_nav_fifo_head + 1) % 64);
@@ -9721,6 +9723,7 @@ static void chatSaveStamp(char* out, size_t cap, uint32_t epoch) {
   else      snprintf(out, cap, "%s", hm);
 }
 static bool uiDataFsIsSdCard();                  // fwd (storage code below) — About page shows the resolved backend
+static fs::FS* uiDataFsPtr();                    // fwd — resolved ui-data backend (&SD_MMC on L2/P4, &SD on CAP_SD boards)
 static File uiDataOpen(const char* name, const char* mode);   // fwd — About page reads the msgs file size
 
 // ---- Segmented store: runtime segment table (loop-task-owned) --------------
@@ -14385,6 +14388,15 @@ static lv_anim_enable_t tabSwitchAnim(int idx) {
   (void)idx;
   return LV_ANIM_OFF;
 #else
+  // Battery saver (Settings > Battery, or the Control Center chip) cuts the slide
+  // too: an instant jump skips the 200-400 ms of full-screen redraw frames on a
+  // device the user already asked to run lean. This is the one choke point for
+  // every animated tab/screen switch (goToTab + homeTileCb: home tiles, the Home
+  // "Unread" widget, swipe-back, function keys), so all of them go at once. The
+  // slide is LVGL's speed-based content scroll, not the tabview anim_time style,
+  // so LV_ANIM_OFF here is the only thing that removes it. Read live (a static
+  // bool) so flipping the saver applies on the next switch, like the aurora gate.
+  if (touchSleep::enabled()) return LV_ANIM_OFF;
   return idx == MAP_TAB_INDEX ? LV_ANIM_OFF : uiAnimOn();
 #endif
 }
@@ -26411,12 +26423,20 @@ static uint16_t batteryFullMv() {
   if (!s_batt_full_loaded) { s_batt_full_mv = touchPrefsGetBattFullMv(); s_batt_full_loaded = true; }
   // A calibration taken on USB before the guard in calibrateBatteryCb stored the charger's
   // rail as 100%, so a full pack resting at 4.18 V read about 60%. Fall back to the default.
-  if (s_batt_full_mv > kBattFullMaxMv) return 4200;
-  return s_batt_full_mv ? s_batt_full_mv : 4200;
+  if (s_batt_full_mv && s_batt_full_mv <= kBattFullMaxMv) return s_batt_full_mv;
+  // Uncalibrated (or a bogus calibration): a board with a measured OCV table uses its
+  // own 100% point (the L2 pack rests at 4.18 V, not 4.20); the rest keep the Li-ion
+  // default. The table's point is scaled by this value in batteryOcvPercent(), so
+  // passing ocv[0] keeps the measured curve's shape.
+  if (const uint16_t* ocv = boardBatteryOcvTable()) return ocv[0];
+  return 4200;
 }
 
-#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9)
+#if defined(HAS_TDECK_GT911) || defined(HELTEC_LORA_V4_R8) || defined(HAS_THINKNODE_M9) || defined(HAS_WIO_TRACKER_L2)
 // (R8 & M9: the divider is permanently connected, so EMA smoothing filters ADC2/Wi-Fi jitter.)
+// (L2: the ADS1115 itself is quiet, but its 30 s cache can land mid-TX-burst at
+// +22 dBm; the EMA smooths the steps between cache updates instead of passing
+// each one straight to the readout.)
 // EMA + above-full voltage heuristic applies; threshold accuracy vs the
 // uncalibrated ADC_MULTIPLIER=5.07 conversion needs on-device confirmation.)
 // Per-board battery sampler: EMA over the noisy ADC so the value doesn't jitter
@@ -26452,11 +26472,22 @@ static uint16_t batteryMvSampled() {
     if (charge_flip || settle_due) s_ema = (float)raw;
     else                           s_ema += d * 0.15f;   // ~7-sample time constant
 #else
-    // A charger plug/unplug steps the rail ~100 mV+ — snap straight to it so the
+    // A charger plug-IN steps the rail ~100 mV+ up — snap straight to it so the
     // charge state is recognized within a tick instead of crawling there over
-    // the EMA. Smaller deltas are ADC noise, so keep smoothing those.
-    if (d > 70.0f || d < -70.0f) s_ema = (float)raw;
-    else                         s_ema += d * 0.15f;   // ~7-sample time constant
+    // the EMA. A step DOWN can be the charger coming off, or just a LoRa TX
+    // burst / screen-on sag: require it to persist 2.5 s before snapping and
+    // hold the EMA meanwhile, so a burst no longer drags the reading down and
+    // lets it crawl back (the sawtooth). A real unplug persists and snaps after
+    // the window — the same settle the M9 branch above uses. Smaller deltas are
+    // ADC noise, so keep smoothing those.
+    static unsigned long s_low_since = 0;
+    if (d > 70.0f) { s_ema = (float)raw; s_low_since = 0; }
+    else if (d < -70.0f) {
+      const unsigned long now_ms = millis();
+      if (!s_low_since) s_low_since = now_ms ? now_ms : 1UL;
+      if ((unsigned long)(now_ms - s_low_since) >= 2500UL) { s_ema = (float)raw; s_low_since = 0; }
+    }
+    else { s_low_since = 0; s_ema += d * 0.15f; }   // ~7-sample time constant
 #endif
   }
   return (uint16_t)(s_ema + 0.5f);
@@ -26568,13 +26599,14 @@ static uint16_t batteryMvSmoothed() {
   return s_pub;
 }
 
-static int batteryPercentFromMv(uint16_t mv);   // fwd decl (icon derives from %)
+static int batteryPercentFromMv(uint16_t mv);      // fwd decl (icon derives from %)
+static int batteryPercentPublished(uint16_t mv);   // fwd decl (ratcheted, below)
 static const char* batteryGlyphForMv(uint16_t mv) {
   if (mv == 0)               return LV_SYMBOL_BATTERY_EMPTY;
   if (batteryIsCharging(mv)) return LV_SYMBOL_CHARGE;   // on USB power
   // Derive the icon from the (calibrated) percent so custom packs whose full
   // voltage differs from 4.2 V still fill the icon at their real 100%.
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   if (pct >= 90) return LV_SYMBOL_BATTERY_FULL;
   if (pct >= 65) return LV_SYMBOL_BATTERY_3;
   if (pct >= 40) return LV_SYMBOL_BATTERY_2;
@@ -26603,14 +26635,42 @@ static int batteryPercentFromMv(uint16_t mv) {
     if (soc >= 0) return soc;
   }
 #endif
-  // Li-ion curve: 3.30 V empty, FULL = the calibrated full (default 4.20 V).
-  // While charging the rail reads above full (charger-driven) — cap at 100
-  // rather than show a bogus number; the real cell % isn't observable here.
+  // Voltage -> % for the gauge-less boards. While charging the rail reads
+  // above full (charger-driven) — cap at 100 rather than show a bogus number;
+  // the real cell % isn't observable here.
   if (mv == 0) return -1;
   const uint16_t full = batteryFullMv();
+  // A board with a measured discharge curve interpolates it (see BatteryOcv.h
+  // for why linear cannot work). The rest keep the legacy linear map —
+  // 3.30 V empty, FULL = the calibrated full — until a table is measured.
+  if (const uint16_t* ocv = boardBatteryOcvTable())
+    return batteryOcvPercent(mv, ocv, BATTERY_OCV_POINTS, full);
   if (mv >= full)  return 100;
   if (mv <= 3300)  return 0;
   return (int)((mv - 3300) * 100 / (full - 3300));
+}
+
+// Published percent: the discharge ratchet. The raw curve % can rise when the
+// load drops (radio idle, screen off) and fall again on the next TX burst, so
+// the readout twitched up and down all day. While discharging, publish only
+// downward moves, and only once they are at least 2 points: in the flat part
+// of the curve a single point is a few mV, and rectifying that ADC noise into
+// the ratchet would drift the reading down while the device sits idle.
+// Charging follows the reading freely, and a charge-state flip re-seeds it.
+// The low-battery guard (pagerLowBatteryTick) keeps calling batteryPercentFromMv
+// directly: it must see the rail RECOVER after a transmit burst, which a
+// ratchet would hide.
+static int  s_batt_pub_pct = -1;
+static bool s_batt_pub_chg = false;
+static void batteryPercentReset() { s_batt_pub_pct = -1; }
+static int batteryPercentPublished(uint16_t mv) {
+  const int pct = batteryPercentFromMv(mv);
+  if (pct < 0) return pct;
+  const bool chg = batteryIsCharging(mv);
+  if (s_batt_pub_pct < 0 || chg || chg != s_batt_pub_chg) s_batt_pub_pct = pct;
+  else if (pct <= s_batt_pub_pct - 2)                     s_batt_pub_pct = pct;
+  s_batt_pub_chg = chg;
+  return s_batt_pub_pct;
 }
 
 // Calibrate-battery action (Device settings). SHORT_CLICKED captures the current
@@ -26622,6 +26682,7 @@ static void calibrateBatteryCb(lv_event_t* e) {
   if (code == LV_EVENT_LONG_PRESSED) {
     touchPrefsSetBattFullMv(0);
     s_batt_full_mv = 0; s_batt_full_loaded = true;
+    batteryPercentReset();   // the curve moved: let the published % re-seed
     if (g_lv.task) g_lv.task->showAlert(TR("Battery calibration reset to default"), 2200);
     return;
   }
@@ -26643,6 +26704,7 @@ static void calibrateBatteryCb(lv_event_t* e) {
   }
   touchPrefsSetBattFullMv(mv);
   s_batt_full_mv = mv; s_batt_full_loaded = true;
+  batteryPercentReset();   // the curve moved: let the published % re-seed
   char b[72];
   snprintf(b, sizeof b, TR("Calibrated: 100%% = %u.%02u V  (long-press to reset)"),
            (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
@@ -26678,21 +26740,21 @@ static inline void sdNoteIoFailure() {
 // of the data lived. SD path lives under /meshcomod with the other files;
 // SPIFFS (flat) uses a top-level path.
 static fs::FS& battLogFs() {
-#if CAP_SD || defined(TLORA_PAGER)
+  // Follow the RESOLVED ui-data backend, not bare CAP_SD: the SD_MMC boards
+  // (Wio L2, P4-class) define CAP_SD 0 but have a working SD_MMC. The old CAP_SD
+  // gate dropped their log onto SPIFFS, which does not mount on the L2, so the
+  // battery history was silently never written there.
   if (uiDataFsIsSdCard()) {
-    if (SD.exists("/meshcomod")) return SD;
+    fs::FS* f = uiDataFsPtr();
+    if (f && f->exists("/meshcomod")) return *f;
     // Backend resolved to SD but real I/O failed — wedge/removal tell.
     sdNoteIoFailure();
   }
-#endif
   return SPIFFS;
 }
 static bool battLogOnSd() {
-#if CAP_SD || defined(TLORA_PAGER)
-  return uiDataFsIsSdCard() && SD.exists("/meshcomod");
-#else
-  return false;
-#endif
+  fs::FS* f = uiDataFsPtr();
+  return uiDataFsIsSdCard() && f && f->exists("/meshcomod");
 }
 static const char* battLogPath() { return battLogOnSd() ? "/meshcomod/battery.log" : "/battery.log"; }
 static const char* battLogTmp()  { return battLogOnSd() ? "/meshcomod/battery.tmp" : "/battery.tmp"; }
@@ -26927,10 +26989,10 @@ static void batteryLogTick(uint32_t now_ms) {
   s_ma_sum = 0; s_ma_n = 0;
   if ((uint16_t)s_bday_today != s_bday_saved) battDaySave();   // at most once per log line
   battUseSave();
-  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv),
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentPublished(mv),
                    (uint16_t)getCpuFrequencyMhz(), has_ma, ma);
 #else
-  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentFromMv(mv),
+  batteryLogAppend((uint32_t)time(nullptr), mv, batteryPercentPublished(mv),
                    (uint16_t)getCpuFrequencyMhz());
 #endif
   hwBattPush((uint32_t)time(nullptr), mv);   // the Battery widget's last 24 h
@@ -28570,7 +28632,7 @@ static void webSendToChannel(int slot, const char* text) {
 static void webPushStatus() {
   if (!g_lv.task || !s_webdata_buf) return;
   uint16_t mv  = batteryMvSmoothed();
-  int      pct = batteryPercentFromMv(mv);
+  int      pct = batteryPercentPublished(mv);
   bool     wc  = (WiFi.status() == WL_CONNECTED);
   uint32_t clk = 0;
   auto* rtc = the_mesh.getRTCClock();
@@ -46304,7 +46366,7 @@ static void settingsCatValue(int c, char* out, size_t cap) {
 #if CAP_BATTERY
     case CAT_BATTERY: {
       const uint16_t mv = batteryMvSmoothed();
-      if (mv) snprintf(out, cap, "%d%%", batteryPercentFromMv(mv));
+      if (mv) snprintf(out, cap, "%d%%", batteryPercentPublished(mv));
       break;
     }
 #endif
@@ -54029,7 +54091,7 @@ static void lockscreenUpdateBattery() {
     if (strcmp(lv_label_get_text(s_lock_batt_gauge), t) != 0) lv_label_set_text(s_lock_batt_gauge, t);
   }
 #endif
-  const int pct = mv ? batteryPercentFromMv(mv) : -1;
+  const int pct = mv ? batteryPercentPublished(mv) : -1;
   const int key = (pct < 0 && !charging) ? -2 : (charging ? 1000 + LV_MAX(pct, 0) : pct);
   if (key == s_lock_batt_key) return;
   s_lock_batt_key = key;
@@ -59874,7 +59936,7 @@ static void openControlCenter() {
 
   // ---- Battery + Wi-Fi info (right) ----
   const uint16_t mv = batteryMvSmoothed();
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   char batt_s[28];
   if (batteryIsCharging(mv))
     snprintf(batt_s, sizeof batt_s, "%s  %u.%02uV", TR("Charging"),
@@ -63404,7 +63466,24 @@ static void docCaptureTour() {
 // Not while the screensaver is up: it reports the screen as off (for input), but it
 // is lit and animating, and light-sleeping would freeze it mid-frame.
 static bool tsScreenOff()  { return g_lv.task && g_lv.task->isScreenOff() && !s_ssaver_on; }
-static bool tsNoClient()   { return the_mesh.getProtoNumClients() == 0 && !g_usb_files_owns_serial; }   // public accessor (proto_num_clients is private)
+// True when no companion app is connected RIGHT NOW. getProtoNumClients() is a
+// since-boot registry of client identities (only ever incremented, reset in the
+// MyMesh constructor), so once any app has connected it stays >0 until reboot
+// and can never gate an idle policy. The transport's isConnected() checks the
+// live links instead: BLE/TCP/WS reflect the current connection state.
+// USB CAVEAT: the core ArduinoSerialInterface::isConnected() returns _clientSeen,
+// set on the first frame a client sends and NEVER cleared — so USB counts as
+// connected from that first frame until reboot, not just while a client is active.
+// A user who once used the USB companion therefore blocks the idle park until
+// reboot. The gate's onBattery term usually masks this (a USB client implies USB
+// power), except on CAP_BATTERY 0 boards that park regardless. The core is upstream
+// libdeps, so the latch cannot be cleared here; documented, not worked around.
+// Shared by the TouchSleep gate and the idle Wi-Fi/BLE policy.
+static bool noLiveCompanionClient() {
+  BaseSerialInterface* si = g_lv.task ? g_lv.task->serialInterface() : nullptr;
+  return !(si && si->isConnected());
+}
+static bool tsNoClient()   { return noLiveCompanionClient() && !g_usb_files_owns_serial; }
 // tsWifiOff: true only when the WiFi radio is actually powered off. The question
 // the gate is asking is "is the modem drawing power", and WiFi.getMode() answers
 // exactly that — WIFI_OFF means esp_wifi is stopped. (WiFi.status() != WL_CONNECTED,
@@ -65283,7 +65362,7 @@ static void updateGlobalStatusBar() {
   // ---- Battery ----
   const uint16_t mv = batteryMvSmoothed();
   const bool charging = batteryIsCharging(mv);
-  const int pct = batteryPercentFromMv(mv);
+  const int pct = batteryPercentPublished(mv);
   static int s_last_pct = -9999;
   static bool s_last_charging = false;
   if (pct != s_last_pct || charging != s_last_charging) {
@@ -67693,7 +67772,7 @@ static void hwBatteryUpdate(int i) {
   HwInst& w = hwI(i);
   const uint16_t mv = batteryMvSmoothed();
   const bool chg = mv && batteryIsCharging(mv);
-  const int pct = mv ? batteryPercentFromMv(mv) : -1;
+  const int pct = mv ? batteryPercentPublished(mv) : -1;
   HwFig* f = hwF(i);
   const uint32_t col = chg ? COLOR_HUE[HUE_DEVICE] : pct >= 0 && pct <= 15 ? COLOR_STATUS_DANGER_TEXT
                      : pct >= 0 && pct <= 30 ? COLOR_STATUS_WARN : COLOR_HUE[HUE_DEVICE];
@@ -77538,7 +77617,7 @@ uint8_t  luaHostRepeatHop(uint32_t fp, uint8_t idx, uint8_t* out, uint8_t cap) {
 void luaHostBattery(uint16_t* mv, int* pct, bool* charging) {
   const uint16_t v = batteryMvSmoothed();
   if (mv)       *mv = v;
-  if (pct)      *pct = batteryPercentFromMv(v);
+  if (pct)      *pct = batteryPercentPublished(v);
   if (charging) *charging = batteryIsCharging(v);
 }
 // wada.sys.gps(). False when there is no fix -- the caller then gets nil rather
@@ -77915,6 +77994,7 @@ void luaHostTextPrompt(const char* title, const char* initial, void (*cb)(const 
 // True when the chat history lives on a removable SD card (T-Deck SPI SD or the
 // Tanmatsu's SD_MMC) rather than internal flash — those devices get the deep
 // message ring (MAX_UI_MESSAGES_SD) since the card has room for the bigger file.
+static fs::FS* uiDataFsPtr() { return s_ui_data_fs; }
 static bool uiDataFsIsSdCard() {
   if (!uiDataFsReady()) return false;
 #if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HAS_CROWPANEL_P4_101) || defined(HAS_WIO_TRACKER_L2)
@@ -81376,7 +81456,8 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
       g_lv.indev_drv.type    = LV_INDEV_TYPE_POINTER;
       g_lv.indev_drv.read_cb = lvglTouchRead;
       g_lv.indev_drv.disp    = lv_disp_get_default();
-      if (!lv_indev_drv_register(&g_lv.indev_drv)) pushDiagLine("LVGL indev failed");
+      if (lv_indev_t* tp = lv_indev_drv_register(&g_lv.indev_drv)) s_touch_indev = tp;
+      else pushDiagLine("LVGL indev failed");
     }
 #endif
 
@@ -82577,6 +82658,22 @@ static void touchPanelSleep(bool slp) {
   s_asleep = slp;
   display.panelSleep(slp);
 }
+#elif defined(HAS_RAK_TAP_V2)
+// ---- RAK Tap V2 ST7789 panel sleep (power, anti burn-in) --------------------
+// The same gap the Pager had. This board defines PIN_TFT_LEDA_CTL, so it takes
+// the HAS_BACKLIGHT_PWM path and screen-off is LEDC duty 0 -- which left the
+// ST7789 refreshing the same static image behind dark glass: panel drive current
+// for nothing, plus the crystal-bias burn-in the other ST7789 boards fixed with
+// SLPIN. display.turnOff() is deliberately NOT used here: it also releases the
+// GPIO14 peripheral rail that the touch controller and the I2C sensors share, so
+// sleeping the panel has to be its own call. The driver routes SLPIN/SLPOUT
+// through LGFX's own SPI2 bus, which is shared with the LoRa radio (bus_shared).
+static void touchPanelSleep(bool slp) {
+  static bool s_asleep = false;
+  if (slp == s_asleep) return;
+  s_asleep = slp;
+  display.panelSleep(slp);
+}
 #else
 static inline void touchPanelSleep(bool) {}
 #endif
@@ -82728,7 +82825,19 @@ static inline void touchScreenBacklight(bool on) {
 // stops listening to the mesh — we just stop burning 240 MHz to render nothing.
 // Restored to 240 MHz on wake so tile decode / rendering stays fast. Only
 // switches when the target changes (the call is a hard DFS switch).
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+#if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
+// The idle regime's master switch. The Pager and the M9 have parked unconditionally
+// since before the Battery saver existed, and gating them now would take away
+// saving their users already rely on. Every other board is opt-in through the
+// saver, like the GNSS rail cut, the panel sleep and the render pause.
+static inline bool idlePowerOptIn() {
+#if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
+  return true;
+#else
+  return touchSleep::enabled();
+#endif
+}
+
 // A joined Wi-Fi is the largest draw after the backlight: with the screen
 // dark and no app connected, let the modem sleep through more beacons (maximum
 // modem sleep: it wakes every listen interval instead of every DTIM). Still
@@ -82742,9 +82851,29 @@ static void pagerWifiPsUpdate(int screen_on) {
   static int8_t s_applied = -1;          // 1 = MAX_MODEM, 0 = MIN_MODEM, -1 = not set
   if (screen_on >= 0) s_screen_on = screen_on != 0;
   if (WiFi.getMode() == WIFI_OFF) { s_applied = -1; return; }
-  const int8_t deep = (!s_screen_on && the_mesh.getProtoNumClients() == 0) ? 1 : 0;
+  // Only touch PS while associated: modem sleep on an unassociated STA naps
+  // through the setup wizard's scan dwell ("no networks found") -- the reason
+  // main.cpp defers WiFi.setSleep until after association on EVERY board, not
+  // just the Wio L2 this guard was first written for. MAX_MODEM only buys
+  // anything on a joined link. main.cpp owns the one-shot DTIM enable at
+  // association; after a link loss the next poll re-applies from scratch.
+  if (WiFi.status() != WL_CONNECTED) { s_applied = -1; return; }
+  // Live connections, not the since-boot client registry: getProtoNumClients()
+  // counts identities registered since boot and only ever increments (reset in
+  // the MyMesh constructor), so once an app had connected it never returned to 0
+  // and the node could not park again until reboot. USB only counts as connected
+  // once a client actually speaks, so a passive debug console does not hold the
+  // modem awake. On the opt-in boards, saver off = the plain DTIM modem sleep
+  // (MIN_MODEM) main.cpp set at association, exactly as before.
+  const bool park = idlePowerOptIn() && !s_screen_on && noLiveCompanionClient();
+  const int8_t deep = park ? 1 : 0;
   if (deep == s_applied) return;
-  if (esp_wifi_set_ps(deep ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM) == ESP_OK) s_applied = deep;
+  if (esp_wifi_set_ps(deep ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM) == ESP_OK) {
+    s_applied = deep;
+#if defined(HAS_WIO_TRACKER_L2)
+    Serial.printf("[wio-l2] wifi ps: %s\n", deep ? "MAX_MODEM (parked)" : "MIN_MODEM (DTIM)");
+#endif
+  }
 }
 #endif
 
@@ -82760,7 +82889,7 @@ static void setCpuForScreen(bool screen_on) {
   setCpuFrequencyMhz(want);
   s_cur_mhz = want;
 #endif
-#if (defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)) && !defined(WADA_WEB)
+#if defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
   pagerWifiPsUpdate(screen_on);
 #endif
 }
@@ -83055,7 +83184,7 @@ static void ssaverBuildStatus(CstStatus& s, bool north_up) {
   }
   const uint16_t mv = batteryMvSmoothed();
   s.charging = mv && batteryIsCharging(mv);
-  s.batt = mv ? batteryPercentFromMv(mv) : -1;
+  s.batt = mv ? batteryPercentPublished(mv) : -1;
 #if defined(TLORA_PAGER)
   pagerGaugeNote(s.batt_note, sizeof s.batt_note);   // the screensaver runs while charging
 #endif
@@ -87054,12 +87183,8 @@ void UITask::loop() {
 #if defined(TLORA_PAGER)
   pagerHapticsIdleTick();   // vibration motor back to standby once its pattern has run out
   pagerImuIdleTick();       // and the accelerometer off once no app is reading it
-#if !defined(WADA_WEB)
-  {
-    static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) { s_wifi_ps_ms = now; pagerWifiPsUpdate(-1); }
-  }
-#endif
+  // The idle Wi-Fi/BLE poll used to live here; it is on the common loop path now,
+  // shared with every other multi-transport board (search s_idle_ps_ms).
   {
     // The stored charging limits (Settings > Battery > Charging), once, as soon as
     // the loop runs: TLoraPagerBoard::begin() starts at the safe defaults.
@@ -87125,12 +87250,6 @@ void UITask::loop() {
 #endif
 #if defined(HAS_THINKNODE_M9)
   pagerLowBatteryTick(now);
-#endif
-#if defined(ESP32) && defined(HAS_THINKNODE_M9) && !defined(WADA_WEB)
-  {
-    static uint32_t s_wifi_ps_ms = 0;
-    if (now - s_wifi_ps_ms >= 1000) { s_wifi_ps_ms = now; pagerWifiPsUpdate(-1); }
-  }
 #endif
   uiCp("ui:keys");
   for (int kbi = 0; kbi < 12; ++kbi) {
@@ -87412,7 +87531,7 @@ void UITask::loop() {
   }
 
   uiCp("ui:battlog");
-  batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
+  batteryLogTick((uint32_t)now);   // 5-min battery sample (resolved ui-data backend: SD/SD_MMC, else SPIFFS)
 #if CAP_SD || defined(TLORA_PAGER)
   uiCp("ui:telem");
   telemetryPollTick((uint32_t)now); // auto-poll due nodes -> log (no window)
@@ -87517,6 +87636,99 @@ void UITask::loop() {
   if (g_web_mirror.active() && g_web_mirror.takeFullRepaint())
     lv_obj_invalidate(lv_scr_act());
 #endif
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(WADA_WEB)
+  // Idle Wi-Fi/BLE power policy: one poll for every multi-transport board. The
+  // Pager and the M9 used to run their own copy from their keyboard-drain
+  // branches; consolidating here leaves one place to reason about and no board
+  // polling twice. Once a second, catch clients coming/going and saver toggles
+  // between screen transitions: parked (screen dark, no live app, on battery)
+  // -> Wi-Fi MAX_MODEM + stretched BLE advertising; any activity reverses both
+  // within the same second. tsScreenOff() excludes the lit screensaver -- it
+  // animates, so the device is not parked while it is up.
+  // idlePowerOptIn() is the Battery saver gate everywhere except the Pager/M9,
+  // whose unconditional park predates the saver (see pagerWifiPsUpdate).
+  // Boards with no battery sensing (CAP_BATTERY 0: CrowPanel 3.5/5.0, SenseCAP,
+  // CrowPanel P4) read tsOnBattery() as always true, so they park whenever dark
+  // with no client. Intended: there is no cell to protect, and a parked modem
+  // still saves power on USB.
+  {
+    static uint32_t s_idle_ps_ms = 0;
+    if (now - s_idle_ps_ms >= 1000) {
+      s_idle_ps_ms = now;
+      pagerWifiPsUpdate(-1);
+      const bool idle = idlePowerOptIn() && tsScreenOff() &&
+                        noLiveCompanionClient() && tsOnBattery();
+      if (auto* mt = static_cast<MultiTransportCompanionInterface*>(serialInterface()))
+        mt->setBleIdleAdvertising(idle);
+    }
+  }
+#endif
+#if !CAP_EPAPER
+  // Dark screen: stop rendering into a panel nobody can see. Pause LVGL's
+  // display refresh timer while the screen is truly off -- not the lit
+  // screensaver (it animates), not the web mirror (it streams the rendered
+  // frames). The input-read and user timers keep running inside
+  // lv_timer_handler, so touch/button wake and app logic are unaffected;
+  // only the render+flush work stops. E-paper is excluded: its glass stays
+  // visible with the front light off, and the lock screen deliberately
+  // repaints while "off" (TDeckProDisplay::refreshWhileAsleep).
+  // Gated on the Battery saver (opt-in): with the saver off the panel keeps
+  // refreshing behind the dark backlight and wake is instant, as before.
+  {
+    static bool s_refr_paused = false;
+    const bool off = g_lv.ready && g_lv.task && g_lv.task->isScreenOff();
+#if !defined(HAS_TANMATSU)
+    const bool dark = off && !s_ssaver_on && !g_web_mirror.active() && touchSleep::enabled();
+#else
+    const bool dark = off && !s_ssaver_on && touchSleep::enabled();
+#endif
+    if (dark != s_refr_paused) {
+      const bool resuming = s_refr_paused && !dark;
+      s_refr_paused = dark;
+      lv_timer_t* rt = _lv_disp_get_refr_timer(nullptr);
+      if (rt) {
+        if (dark) lv_timer_pause(rt);
+        else      lv_timer_resume(rt);
+      }
+      // A panel that slept behind a dark backlight can come back with stale
+      // or lost frame RAM (the ST7796 Pager saw corrupted bands after wake),
+      // and nothing rendered while the timer was paused. Repaint everything
+      // on resume so wake always shows the current screen -- the same
+      // full-frame wake the Pager does in touchScreenBacklight().
+      if (resuming && g_lv.ready) lv_obj_invalidate(lv_scr_act());
+    }
+  }
+#endif
+  // Dark screen: slow the physical touch indev's read timer. LVGL keeps reading it
+  // at LV_INDEV_DEF_READ_PERIOD (15 ms) with nothing on the glass, and on the
+  // inline-poll boards every read is a real bus transaction: the Wio L2 and the
+  // CrowPanel 3.5 share I2C0 between the GT911 and the expander/ADC, so they
+  // deliberately never start the background poll task (see the touch-init branch)
+  // and heltecV4CapTouchSetSlowPoll() has no task to throttle there. ~67 reads/s
+  // for nothing. 50 ms cuts that by two thirds and is the period the V4-R8's poll
+  // task already uses while dark. Deliberately not slower: wake is driven from
+  // this read (lvglTouchRead -> noteUserInput), so a tap must still overlap a poll
+  // or it is missed entirely and the screen stays dark under the finger.
+  // Only the physical touch indev is touched -- the web mirror's pointer must stay
+  // responsive, and the keypad indev costs no bus. Opt-in with the Battery saver,
+  // like the render pause above. E-paper is included: its glass stays visible, but
+  // these reads are still idle work while the device is parked.
+  {
+    static constexpr uint32_t kTouchDarkReadMs = 50;
+    static bool s_touch_slow = false;
+    const bool off = g_lv.ready && g_lv.task && g_lv.task->isScreenOff();
+#if !defined(HAS_TANMATSU)
+    const bool dark = off && !s_ssaver_on && !g_web_mirror.active() && touchSleep::enabled();
+#else
+    const bool dark = off && !s_ssaver_on && touchSleep::enabled();
+#endif
+    if (dark != s_touch_slow) {
+      s_touch_slow = dark;
+      if (s_touch_indev && s_touch_indev->driver && s_touch_indev->driver->read_timer)
+        lv_timer_set_period(s_touch_indev->driver->read_timer,
+                            dark ? kTouchDarkReadMs : (uint32_t)LV_INDEV_DEF_READ_PERIOD);
+    }
+  }
   uiCp("ui:lvgl");
 #if defined(TLORA_PAGER) || defined(HAS_THINKNODE_M9)
   const uint32_t lv_next_ms = lv_timer_handler();
