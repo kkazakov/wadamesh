@@ -22,7 +22,7 @@ extern "C" void set_boot_phase(int phase);
   #include <helpers/ui/MomentaryButton.h>
 #endif
 #include "helpers/sensors/EnvironmentSensorManager.h"
-#include "helpers/sensors/MicroNMEALocationProvider.h"
+#include "../../src/helpers/WadaNmeaLocationProvider.h"   // the core provider plus UBX stop/start
 
 extern RAKTapV2Board board;
 extern WRAPPER_CLASS radio_driver;
