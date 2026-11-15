@@ -9619,6 +9619,7 @@ static void chatSaveStamp(char* out, size_t cap, uint32_t epoch) {
   else      snprintf(out, cap, "%s", hm);
 }
 static bool uiDataFsIsSdCard();                  // fwd (storage code below) — About page shows the resolved backend
+static fs::FS* uiDataFsPtr();                    // fwd — resolved ui-data backend (&SD_MMC on L2/P4, &SD on CAP_SD boards)
 static File uiDataOpen(const char* name, const char* mode);   // fwd — About page reads the msgs file size
 
 // ---- Segmented store: runtime segment table (loop-task-owned) --------------
@@ -26432,21 +26433,21 @@ static inline void sdNoteIoFailure() {
 // of the data lived. SD path lives under /meshcomod with the other files;
 // SPIFFS (flat) uses a top-level path.
 static fs::FS& battLogFs() {
-#if CAP_SD || defined(TLORA_PAGER)
+  // Follow the RESOLVED ui-data backend, not bare CAP_SD: the SD_MMC boards
+  // (Wio L2, P4-class) define CAP_SD 0 but have a working SD_MMC. The old CAP_SD
+  // gate dropped their log onto SPIFFS, which does not mount on the L2, so the
+  // battery history was silently never written there.
   if (uiDataFsIsSdCard()) {
-    if (SD.exists("/meshcomod")) return SD;
+    fs::FS* f = uiDataFsPtr();
+    if (f && f->exists("/meshcomod")) return *f;
     // Backend resolved to SD but real I/O failed — wedge/removal tell.
     sdNoteIoFailure();
   }
-#endif
   return SPIFFS;
 }
 static bool battLogOnSd() {
-#if CAP_SD || defined(TLORA_PAGER)
-  return uiDataFsIsSdCard() && SD.exists("/meshcomod");
-#else
-  return false;
-#endif
+  fs::FS* f = uiDataFsPtr();
+  return uiDataFsIsSdCard() && f && f->exists("/meshcomod");
 }
 static const char* battLogPath() { return battLogOnSd() ? "/meshcomod/battery.log" : "/battery.log"; }
 static const char* battLogTmp()  { return battLogOnSd() ? "/meshcomod/battery.tmp" : "/battery.tmp"; }
@@ -76977,6 +76978,7 @@ void luaHostTextPrompt(const char* title, const char* initial, void (*cb)(const 
 // True when the chat history lives on a removable SD card (T-Deck SPI SD or the
 // Tanmatsu's SD_MMC) rather than internal flash — those devices get the deep
 // message ring (MAX_UI_MESSAGES_SD) since the card has room for the bigger file.
+static fs::FS* uiDataFsPtr() { return s_ui_data_fs; }
 static bool uiDataFsIsSdCard() {
   if (!uiDataFsReady()) return false;
 #if defined(HAS_TANMATSU) || defined(HAS_TDISPLAY_P4) || defined(HAS_CROWPANEL_P4_101) || defined(HAS_WIO_TRACKER_L2)
@@ -86392,7 +86394,7 @@ void UITask::loop() {
   }
 
   uiCp("ui:battlog");
-  batteryLogTick((uint32_t)now);   // 5-min battery sample (SD on T-Deck, else SPIFFS)
+  batteryLogTick((uint32_t)now);   // 5-min battery sample (resolved ui-data backend: SD/SD_MMC, else SPIFFS)
 #if CAP_SD || defined(TLORA_PAGER)
   uiCp("ui:telem");
   telemetryPollTick((uint32_t)now); // auto-poll due nodes -> log (no window)
