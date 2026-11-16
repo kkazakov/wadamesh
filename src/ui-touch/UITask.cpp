@@ -58960,6 +58960,9 @@ static bool    s_bl_pwm_ready   = false;
 constexpr int  kBlPwmChannel    = 6;
 
 static void applyBrightness(uint8_t pct) {
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] apply t=%lu %u->%u\n", millis(), s_brightness_pct, pct);
+#endif
   if (pct < 5)   pct = 5;
   if (pct > 100) pct = 100;
   s_brightness_pct = pct;
@@ -58968,7 +58971,16 @@ static void applyBrightness(uint8_t pct) {
     ledcAttachPin(PIN_TFT_LEDA_CTL, kBlPwmChannel);  // takes the pin over from the display's digitalWrite
     s_bl_pwm_ready = true;
   }
-  ledcWrite(kBlPwmChannel, (uint32_t)pct * 255u / 100u);
+  // TEST: avoid ledcWrite's full-on special case (duty==255 -> writes 256). The
+  // screensaver-wake restore to 100% (duty 256) was observed not to latch, while
+  // writes below 255 latch fine. Cap at 254 (~99%) to stay out of that case.
+  uint32_t duty = (uint32_t)pct * 255u / 100u;
+  if (duty > 254u) duty = 254u;
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] duty t=%lu ch=%d duty=%lu readback=%lu\n",
+                millis(), kBlPwmChannel, duty, (unsigned long)ledcRead(kBlPwmChannel));
+#endif
+  ledcWrite(kBlPwmChannel, duty);
 }
 #elif defined(HAS_TANMATSU)
 // Tanmatsu: backlights + audio go through the bsp — the CH32 coprocessor (screen +
@@ -81956,6 +81968,9 @@ static inline void touchScreenBacklight(bool on) {
   // then be a no-op (on the V4, TFT_BL == PIN_TFT_LEDA_CTL == GPIO21), so drive
   // the PWM duty directly: 0 = off, saved brightness = on.
   if (!s_bl_pwm_ready) applyBrightness(s_brightness_pct);   // ensure LEDC is attached
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] bl t=%lu on=%d pct=%u\n", millis(), on, s_brightness_pct);
+#endif
   if (on) touchPanelSleep(false);   // wake the panel BEFORE lighting it (old frame intact)
   ledcWrite(kBlPwmChannel, on ? ((uint32_t)s_brightness_pct * 255u / 100u) : 0u);
   if (!on) touchPanelSleep(true);   // then stop the panel driving the crystals (anti burn-in)
@@ -82130,6 +82145,13 @@ static bool     s_ssaver_seen_power   = false;   // on external power at some po
 static bool     s_ssaver_preview_req  = false;
 static bool     s_ssaver_is_preview   = false;
 static uint8_t  s_ssaver_saved_bright = 0;
+// Re-assert the restored brightness for a short window after a lit teardown. The
+// first backlight write right after the screensaver ends can fail to latch (seen on
+// the T-Deck's LEDC PWM: the restore to the user's level is issued, yet the panel
+// stays at the dimmed 40% until some later write lands). Re-applying the same level
+// over the next few loop passes guarantees it takes. 0 = no re-assert pending.
+static uint32_t s_ssaver_reapply_ms   = 0;
+static uint32_t s_ssaver_reapply_next = 0;
 static uint32_t s_ssaver_unplugged_ms = 0;   // when it went onto battery (0 = charging)
 static uint32_t s_ssaver_nodes_ms     = 0;
 static uint32_t s_ssaver_status_ms    = 0;
@@ -82465,6 +82487,11 @@ static void ssaverStart(uint32_t now, bool preview) {
   s_ssaver_saved_bright = s_brightness_pct;
   applyBrightness(s_brightness_pct > 40 ? 40 : s_brightness_pct);
 #endif
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] start t=%lu preview=%d saved=%u pct=%u start_ms=%lu\n",
+                millis(), preview, s_ssaver_saved_bright, s_brightness_pct,
+                (unsigned long)s_ssaver_start_ms);
+#endif
 }
 
 // `lit`: the screen stays on (woken, or a lock screen took over), so put the
@@ -82473,15 +82500,29 @@ static void ssaverStart(uint32_t now, bool preview) {
 // and would light a screen that is meant to be off. The next wake applies it.
 static void ssaverTeardown(bool lit) {
   if (!s_ssaver_on) return;
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] teardown t=%lu lit=%d saved=%u pct=%u\n",
+                millis(), lit, s_ssaver_saved_bright, s_brightness_pct);
+#endif
   showUnder(s_ssaver_under);
   cstHide();
   s_ssaver_on = false;
   s_ssaver_is_preview = false;
 #if defined(HAS_CC_BRIGHTNESS)
   if (s_ssaver_saved_bright) {
-    if (lit) applyBrightness(s_ssaver_saved_bright);
-    else     s_brightness_pct = s_ssaver_saved_bright;
+    if (lit) {
+      applyBrightness(s_ssaver_saved_bright);
+      // Arm the post-wake re-assert (see s_ssaver_reapply_ms): the first write can
+      // fail to latch, so keep re-applying the restored level for a short window.
+      s_ssaver_reapply_ms   = millis() ? millis() : 1;
+      s_ssaver_reapply_next = 0;
+    } else {
+      s_brightness_pct = s_ssaver_saved_bright;
+    }
   }
+#endif
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] teardown done t=%lu pct=%u\n", millis(), s_brightness_pct);
 #endif
 }
 
@@ -82556,6 +82597,12 @@ void UITask::noteUserInput() {
 }
 
 void UITask::wakeScreen() {
+#if defined(SSAVER_DIAG) && CAP_SCREENSAVER
+  Serial.printf("[SSD] wake t=%lu off=%d ssaver=%d preview=%d since=%lu lock=%d pin=%d pct=%u\n",
+                millis(), _screen_off, s_ssaver_on, s_ssaver_is_preview,
+                s_ssaver_on ? (unsigned long)(millis() - s_ssaver_start_ms) : 0UL,
+                _manual_lock, s_pin_on, s_brightness_pct);
+#endif
   if (!_screen_off) return;
   g_lv.dirty_timeline = true;   // an open chat comes back into view (refreshChatDetail marks read)
   // Several boards unlock with a plain wake (their button is the unlock control).
@@ -82565,13 +82612,21 @@ void UITask::wakeScreen() {
   if (s_ssaver_on) {
     // A preview ignores input for its first moment: the key or tap that asked for it
     // (its release, a repeat) used to end it after half a second (#609, Tanmatsu).
-    if (s_ssaver_is_preview && (uint32_t)(millis() - s_ssaver_start_ms) < 1200) return;
+    if (s_ssaver_is_preview && (uint32_t)(millis() - s_ssaver_start_ms) < 1200) {
+#if defined(SSAVER_DIAG)
+      Serial.printf("[SSD] wake preview-guard block t=%lu\n", millis());
+#endif
+      return;
+    }
     // The screensaver is already lit and the CPU at full speed: nothing to power
     // up. Clearing _screen_off is what ends it; loop() tears it down and puts the
     // user's brightness back.
     _screen_off    = false;
     _manual_lock   = false;
     _last_input_ms = millis();
+#if defined(SSAVER_DIAG)
+    Serial.printf("[SSD] wake ssaver-branch cleared t=%lu\n", millis());
+#endif
     return;
   }
 #endif
@@ -82580,6 +82635,9 @@ void UITask::wakeScreen() {
   _screen_off    = false;
   _manual_lock   = false;
   _last_input_ms = millis();
+#if defined(SSAVER_DIAG)
+  Serial.printf("[SSD] wake plain-branch lit t=%lu pct=%u\n", millis(), s_brightness_pct);
+#endif
 }
 
 void UITask::lockScreen() {
@@ -85739,13 +85797,44 @@ void UITask::loop() {
   }
   if (s_ssaver_on) {
     if (!_screen_off) {
+#if defined(SSAVER_DIAG)
+      Serial.printf("[SSD] loop: screen lit -> teardown(true) t=%lu\n", millis());
+#endif
       ssaverTeardown(true);
     } else if (ssaverTick(now)) {
+#if defined(SSAVER_DIAG)
+      Serial.printf("[SSD] loop: time up -> teardown(false) t=%lu\n", millis());
+#endif
       ssaverTeardown(false);
       touchScreenBacklight(false);
       setCpuForScreen(false);
     }
   }
+  // Post-wake brightness re-assert (see s_ssaver_reapply_ms): the first backlight
+  // write after a lit teardown can fail to latch on the LEDC PWM boards, leaving the
+  // panel at the screensaver's dimmed level. Re-apply the restored level for a short
+  // window so it always takes. Stop at once if the screen goes dark or the saver
+  // restarts, so this never lights a screen that is meant to be off.
+#if defined(HAS_CC_BRIGHTNESS)
+  if (s_ssaver_reapply_ms) {
+    if (_screen_off || s_ssaver_on) {
+      s_ssaver_reapply_ms = 0;
+    } else {
+      const uint32_t ra_now = millis();
+      if ((uint32_t)(ra_now - s_ssaver_reapply_ms) < 300u) {
+        if ((int32_t)(ra_now - s_ssaver_reapply_next) >= 0) {
+          s_ssaver_reapply_next = ra_now + 40u;
+#if defined(SSAVER_DIAG)
+          Serial.printf("[SSD] reapply t=%lu pct=%u\n", ra_now, s_brightness_pct);
+#endif
+          applyBrightness(s_brightness_pct);
+        }
+      } else {
+        s_ssaver_reapply_ms = 0;
+      }
+    }
+  }
+#endif
 #endif
 
 #if defined(HAS_TDECK_KEYBOARD) || defined(HAS_M9_KEYBOARD)   // notify-flash (and so the notify wake): T-Deck + M9
