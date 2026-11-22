@@ -78,6 +78,29 @@ zoom slider and +/- buttons to the levels the map actually holds: the selected
 archive's zoom range, or with **Folder tiles only** every `z` folder of the
 `maps/osm/z/x/y` and `tiles/z/x/y` trees.
 
+### Downloading a pack with `scripts/tiledl.py`
+
+Tile sourcing is the same rule as below: only a provider whose terms allow
+bulk/offline download. The script writes the card layout directly, skips tiles
+already present (so an interrupted run resumes), validates every download as
+PNG, and refuses the OSM community tile servers:
+
+```bash
+scripts/tiledl.py --out /media/$USER/SDCARD \
+    --bbox 48.10,11.40,48.25,11.70 --zoom 9-16 \
+    --url 'https://tiles.example.org/{z}/{x}/{y}.png' \
+    --contact you@example.org
+```
+
+`--bbox` is `south,west,north,east`; `--center LAT,LON --radius-km N` is the
+shorthand for a local area. The default target is `<card>/maps/osm/z/x/y.png`
+(the firmware's first choice); `--layout tiles` writes `<card>/tiles/...`
+instead. Use `--dry-run` to see the tile count before downloading, and raise
+`--max-tiles` when a legitimate area exceeds the default 25,000 guard. Tiles
+are fetched with four workers; lower `--workers` or set `--rate` if the
+provider asks for a gentler rate. Keep the provider's attribution with the
+pack.
+
 To create a compatible pack with [QGIS](https://qgis.org/):
 
 1. Add a map source whose licence and service terms explicitly permit offline
