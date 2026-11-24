@@ -27361,25 +27361,33 @@ static int batteryPercentFromMv(uint16_t mv) {
   return (int)((mv - empty) * 100 / (full - empty));
 }
 
-// Published percent: the discharge ratchet. The raw curve % can rise when the
-// load drops (radio idle, screen off) and fall again on the next TX burst, so
-// the readout twitched up and down all day. While discharging, publish only
-// downward moves, and only once they are at least 2 points: in the flat part
-// of the curve a single point is a few mV, and rectifying that ADC noise into
-// the ratchet would drift the reading down while the device sits idle.
+// Published percent: a 2-point deadband on the curve reading, in BOTH
+// directions. The raw curve % can rise when the load drops (radio idle, screen
+// off) and fall again on the next TX burst, so the readout twitched; in the flat
+// part of the curve one point is only a few mV, so ignoring moves smaller than
+// 2 points removes the twitch without hiding real discharge.
+//
+// This used to be a ratchet: while discharging it accepted ONLY downward moves.
+// That turned every load sag into a permanent loss, because terminal voltage is
+// not state of charge — a +22 dBm burst pulls the rail well below the resting
+// voltage, the ratchet took that as charge lost, and nothing could ever raise
+// the number again while discharging (only a charger plug/unplug re-seeded it).
+// On an L2/T-Deck/P4 that leaves the indicator tens of points low for the rest
+// of the session: measured 63% published against ~93% actual in a replay of the
+// sag/recovery sequence. Symmetric is the fix: same deadband, no lock-in.
+//
 // Charging follows the reading freely, and a charge-state flip re-seeds it.
 // The low-battery guard (pagerLowBatteryTick) keeps calling batteryPercentFromMv
-// directly: it must see the rail RECOVER after a transmit burst, which a
-// ratchet would hide.
+// directly: it must see the rail RECOVER after a transmit burst.
 static int  s_batt_pub_pct = -1;
 static bool s_batt_pub_chg = false;
-static void batteryPercentReset() { s_batt_pub_pct = -1; }
+static void batteryPercentReset() { s_batt_pub_pct = -1; s_batt_pub_chg = false; }
 static int batteryPercentPublished(uint16_t mv) {
   const int pct = batteryPercentFromMv(mv);
   if (pct < 0) return pct;
   const bool chg = batteryIsCharging(mv);
   if (s_batt_pub_pct < 0 || chg || chg != s_batt_pub_chg) s_batt_pub_pct = pct;
-  else if (pct <= s_batt_pub_pct - 2)                     s_batt_pub_pct = pct;
+  else if (pct <= s_batt_pub_pct - 2 || pct >= s_batt_pub_pct + 2) s_batt_pub_pct = pct;
   s_batt_pub_chg = chg;
   return s_batt_pub_pct;
 }
